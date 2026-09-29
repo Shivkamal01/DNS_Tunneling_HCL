@@ -1,4 +1,4 @@
-# Intelligent DNS Tunneling Detection & SOC Platform
+# Incident Detection for DNS Tunneling Attack
 
 ## Executive Summary
 This project is an end-to-end cybersecurity pipeline designed to detect covert DNS tunneling—a technique used by Advanced Persistent Threats (APTs) to bypass firewalls and exfiltrate data. By mathematically analyzing network payloads rather than relying on static binary rules, this engine calculates the probability of malicious encoding in real-time.
