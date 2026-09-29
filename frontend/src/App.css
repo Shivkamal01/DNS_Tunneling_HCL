@@ -1,0 +1,77 @@
+body {
+  margin: 0;
+  background-color: #121212;
+}
+
+.dashboard { 
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+  color: #ffffff; 
+  min-height: 100vh; 
+  padding: 20px; 
+}
+
+.header h1 { 
+  margin-top: 0; 
+  color: #00e676; 
+  border-bottom: 1px solid #333; 
+  padding-bottom: 15px; 
+}
+
+.content { 
+  display: flex; 
+  flex-direction: column; 
+  gap: 20px; 
+}
+
+.chart-container, .table-container { 
+  background-color: #1e1e1e; 
+  padding: 20px; 
+  border-radius: 8px; 
+  box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
+}
+
+table { 
+  width: 100%; 
+  border-collapse: collapse; 
+  margin-top: 10px; 
+  text-align: left; 
+}
+
+th, td { 
+  padding: 12px; 
+  border-bottom: 1px solid #333; 
+}
+
+th { 
+  color: #aaaaaa; 
+  font-weight: normal; 
+}
+
+.badge { 
+  padding: 4px 8px; 
+  border-radius: 4px; 
+  font-weight: bold; 
+  font-size: 0.85em; 
+}
+
+.critical { background-color: #d32f2f; color: white; }
+.high { background-color: #f57c00; color: white; }
+.medium { background-color: #fbc02d; color: black; }
+.low { background-color: #388e3c; color: white; }
+
+
+
+.status-dropdown {
+  background-color: #333;
+  color: white;
+  border: 1px solid #555;
+  padding: 5px;
+  border-radius: 4px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.status-dropdown:focus {
+  outline: none;
+  border-color: #00e676;
+}

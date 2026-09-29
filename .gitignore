@@ -1,0 +1,17 @@
+# Python environment and cache
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Node/React dependencies
+frontend/node_modules/
+frontend/build/
+.env
+
+# Database and Logs
+zeek/logs/
+datasets/*.pcap
+*.log
+
+# OS generated files
+.DS_Store
