@@ -1,15 +1,8 @@
 import math
+import os
 import psycopg2
 from scapy.all import PcapReader, DNS, DNSQR, IP
-
-# Database configuration
-DB_CONFIG = {
-    "dbname": "dns_tunneling_db",
-    "user": "db_user",
-    "password": "securepassword123",
-    "host": "localhost",
-    "port": "5432"
-}
+from config import DB_CONFIG
 
 def calculate_entropy(data):
     if not data: return 0
@@ -100,4 +93,8 @@ def analyze_pcap(pcap_path):
     print("Analysis complete. Threats and traffic saved to PostgreSQL!")
 
 if __name__ == "__main__":
-    analyze_pcap("../datasets/suspicious/test_traffic.pcap")
+    # Resolve path relative to this script's location, works on both Linux and Windows
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    pcap_path = os.path.join(base_dir, "..", "datasets", "suspicious", "test_traffic.pcap")
+    analyze_pcap(os.path.normpath(pcap_path))
+

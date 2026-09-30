@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import uvicorn
+from config import DB_CONFIG
 
 app = FastAPI(title="DNS Tunneling Detection API")
 
@@ -15,13 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_CONFIG = {
-    "dbname": "dns_tunneling_db",
-    "user": "db_user",
-    "password": "securepassword123",
-    "host": "localhost",
-    "port": "5432"
-}
 
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)

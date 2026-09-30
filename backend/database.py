@@ -1,13 +1,5 @@
 import psycopg2
-
-# Database connection credentials
-DB_CONFIG = {
-    "dbname": "dns_tunneling_db",
-    "user": "db_user",
-    "password": "securepassword123",
-    "host": "localhost",
-    "port": "5432"
-}
+from config import DB_CONFIG
 
 def init_db():
     """Connects to PostgreSQL and creates the necessary project tables."""

@@ -1,16 +1,13 @@
 import math
 import os
 import psycopg2
+from config import DB_CONFIG
 
-DB_CONFIG = {
-    "dbname": "dns_tunneling_db",
-    "user": "db_user",
-    "password": "securepassword123",
-    "host": "localhost",
-    "port": "5432"
-}
-
-LOG_PATH = os.path.expanduser("~/dns-tunneling-detector/zeek/logs/dns.log")
+# Zeek log path — override via ZEEK_LOG_PATH env variable or .env file
+# Default falls back to <project_root>/zeek/logs/dns.log (cross-platform)
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+_default_log = os.path.normpath(os.path.join(_base_dir, "..", "zeek", "logs", "dns.log"))
+LOG_PATH = os.getenv("ZEEK_LOG_PATH", _default_log)
 
 def calculate_entropy(data: str) -> float:
     """Calculates Shannon entropy: H(X) = -sum(p(x) * log2(p(x)))"""
