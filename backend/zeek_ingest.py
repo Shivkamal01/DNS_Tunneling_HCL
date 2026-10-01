@@ -1,46 +1,13 @@
-import math
 import os
 import psycopg2
 from config import DB_CONFIG
+from utils import calculate_entropy, evaluate_risk
 
 # Zeek log path — override via ZEEK_LOG_PATH env variable or .env file
-# Default falls back to <project_root>/zeek/logs/dns.log (cross-platform)
+# Default falls back to <project_root>\zeek\logs\dns.log (cross-platform)
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 _default_log = os.path.normpath(os.path.join(_base_dir, "..", "zeek", "logs", "dns.log"))
 LOG_PATH = os.getenv("ZEEK_LOG_PATH", _default_log)
-
-def calculate_entropy(data: str) -> float:
-    """Calculates Shannon entropy: H(X) = -sum(p(x) * log2(p(x)))"""
-    if not data:
-        return 0.0
-    entropy = 0.0
-    length = len(data)
-    for char in set(data):
-        p_x = data.count(char) / length
-        entropy -= p_x * math.log2(p_x)
-    return entropy
-
-def evaluate_risk(query_length: int, entropy: float):
-    score = 0
-    indicators = []
-
-    if query_length > 45:
-        score += 15
-        indicators.append("Long query length (>45)")
-    if entropy > 3.8:
-        score += 20
-        indicators.append(f"High entropy ({entropy:.2f} > 3.8)")
-
-    if score <= 29:
-        severity = "Low"
-    elif score <= 59:
-        severity = "Medium"
-    elif score <= 79:
-        severity = "High"
-    else:
-        severity = "Critical"
-
-    return score, severity, indicators
 
 def parse_zeek_dns_log():
     if not os.path.exists(LOG_PATH):

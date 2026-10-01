@@ -108,6 +108,17 @@ body {
   gap: 14px;
 }
 
+/* ── Last Updated indicator ─────────────────────────── */
+.last-updated {
+  font-size: 0.75rem;
+  color: var(--text-3);
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
 /* ── Connection indicator ────────────────────────────── */
 .connection-indicator {
   display: flex;
@@ -297,6 +308,21 @@ body {
   margin-top: 2px;
   font-weight: 400;
 }
+
+.stat-value-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stat-trend {
+  font-size: 0.85rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.stat-trend.up { color: #ef4444; }
+.stat-trend.down { color: #10b981; }
 
 /* ── Main content area ───────────────────────────────── */
 .content {
@@ -691,7 +717,8 @@ td { font-size: 0.9rem; color: #cbd5e1; }
 
 .domain-cell { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 0.85rem !important; color: #94a3b8 !important; }
 .ip-cell     { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 0.85rem !important; color: #64748b !important; }
-.reason-cell { font-size: 0.85rem !important; color: var(--text-2) !important; }
+.reason-cell { font-size: 0.85rem !important; color: var(--text-2) !important; max-width: 220px; }
+.time-cell   { font-size: 0.78rem !important; color: var(--text-3) !important; white-space: nowrap; }
 
 /* ── Severity badge ──────────────────────────────────── */
 .severity-badge {
@@ -1149,4 +1176,58 @@ td { font-size: 0.9rem; color: #cbd5e1; }
   .filter-tabs { width: 100%; overflow-x: auto; flex-wrap: nowrap; }
   .detail-actions { flex-direction: column; }
   .detail-top-row { flex-wrap: wrap; }
+  .time-cell { display: none; }
+}
+
+/* ── Detail separator and time ──────────────────────── */
+.detail-separator {
+  color: var(--text-3);
+  margin: 0 4px;
+}
+
+.detail-time {
+  font-size: 0.82rem;
+  color: var(--text-2);
+}
+
+/* ── Error Boundary ─────────────────────────────────── */
+.error-boundary {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 40px;
+}
+
+.error-boundary-content {
+  text-align: center;
+  max-width: 460px;
+}
+
+.error-boundary-icon {
+  font-size: 3rem;
+  display: block;
+  margin-bottom: 16px;
+}
+
+.error-boundary-content h2 {
+  margin-bottom: 12px;
+  justify-content: center;
+}
+
+.error-boundary-content h2::before {
+  display: none;
+}
+
+.error-boundary-content p {
+  color: var(--text-2);
+  font-size: 0.9rem;
+  margin-bottom: 24px;
+  line-height: 1.6;
+}
+
+/* ── Risk Trend Area Chart ──────────────────────────── */
+.chart-area {
+  animation: fadeUp 0.6s 0.25s ease both;
 }

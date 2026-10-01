@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import uvicorn
+from datetime import datetime, date
 from config import DB_CONFIG
 
 app = FastAPI(title="DNS Tunneling Detection API")
@@ -37,6 +38,11 @@ def get_alerts():
             ORDER BY a.created_at DESC;
         """)
         alerts = cursor.fetchall()
+        # Serialize datetime objects for JSON
+        for alert in alerts:
+            for key, val in alert.items():
+                if isinstance(val, (datetime, date)):
+                    alert[key] = val.isoformat()
         return {"status": "success", "data": alerts}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -66,4 +72,4 @@ def update_alert_status(alert_id: int, update: StatusUpdate):
         if 'conn' in locals(): conn.close()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

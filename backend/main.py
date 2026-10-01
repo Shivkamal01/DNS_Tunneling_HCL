@@ -1,34 +1,8 @@
-import math
 import os
 import psycopg2
 from scapy.all import PcapReader, DNS, DNSQR, IP
 from config import DB_CONFIG
-
-def calculate_entropy(data):
-    if not data: return 0
-    entropy = 0
-    for x in set(data):
-        p_x = float(data.count(x)) / len(data)
-        entropy += - p_x * math.log2(p_x)
-    return entropy
-
-def evaluate_risk(query_length, entropy):
-    score = 0
-    indicators = []
-    
-    if query_length > 45:
-        score += 15
-        indicators.append("Long query")
-    if entropy > 3.8:
-        score += 20
-        indicators.append("High entropy")
-        
-    if score <= 29: severity = "Low"
-    elif score <= 59: severity = "Medium"
-    elif score <= 79: severity = "High"
-    else: severity = "Critical"
-    
-    return score, severity, indicators
+from utils import calculate_entropy, evaluate_risk
 
 def analyze_pcap(pcap_path):
     print("Connecting to database and analyzing traffic...")
@@ -71,21 +45,22 @@ def analyze_pcap(pcap_path):
                     if score > 0:
                         reason = ", ".join(indicators)
                         cursor.execute("""
-                            INSERT INTO alerts (query_id, risk_score, severity, detection_reason)
-                            VALUES (%s, %s, %s, %s) RETURNING id;
+                            INSERT INTO alerts (query_id, risk_score, severity, detection_reason, status)
+                            VALUES (%s, %s, %s, %s, 'OPEN') RETURNING id;
                         """, (query_id, score, severity, reason))
                         alert_id = cursor.fetchone()[0]
                         
                         # 4. If High or Critical, automatically open an incident
                         if severity in ["High", "Critical"]:
                             cursor.execute("""
-                                INSERT INTO incidents (alert_id, source_ip, domain, severity)
-                                VALUES (%s, %s, %s, %s);
+                                INSERT INTO incidents (alert_id, source_ip, domain, severity, status)
+                                VALUES (%s, %s, %s, %s, 'INVESTIGATING');
                             """, (alert_id, src_ip, domain, severity))
                             
                     conn.commit()
                 except Exception as e:
                     conn.rollback()
+                    print(f"[!] Error processing packet: {e}")
                     continue
                     
     cursor.close()
@@ -97,4 +72,3 @@ if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
     pcap_path = os.path.join(base_dir, "..", "datasets", "suspicious", "test_traffic.pcap")
     analyze_pcap(os.path.normpath(pcap_path))
-
