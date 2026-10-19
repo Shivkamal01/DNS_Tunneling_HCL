@@ -1,106 +1,146 @@
+"""
+Zeek dns.log ingestion.
+
+Handles the tab-separated format Zeek writes, including the unset-field marker
+("-"), the multi-value TTLs column, and the header block that declares column
+order. Column positions are read from #fields rather than assumed, so the
+importer keeps working across Zeek version changes.
+"""
+
+import argparse
+import logging
 import os
+from datetime import datetime
+
 import psycopg2
+
 from config import DB_CONFIG
-from utils import calculate_entropy, evaluate_risk
+from ingest import ingest_record, load_whitelist
 
-# Zeek log path — override via ZEEK_LOG_PATH env variable or .env file
-# Default falls back to <project_root>\zeek\logs\dns.log (cross-platform)
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
 _base_dir = os.path.dirname(os.path.abspath(__file__))
-_default_log = os.path.normpath(os.path.join(_base_dir, "..", "zeek", "logs", "dns.log"))
-LOG_PATH = os.getenv("ZEEK_LOG_PATH", _default_log)
+DEFAULT_LOG = os.path.normpath(os.path.join(_base_dir, "..", "zeek", "logs", "dns.log"))
+COMMIT_EVERY = 500
 
-def parse_zeek_dns_log():
-    if not os.path.exists(LOG_PATH):
-        print(f"[!] Log file not found: {LOG_PATH}")
-        return
+UNSET = "-"
+
+
+def _first_ttl(raw: str) -> int:
+    """Zeek records TTLs as a comma-separated vector; take the first sensible value."""
+    if not raw or raw == UNSET:
+        return 0
+    for candidate in raw.split(","):
+        try:
+            return int(float(candidate))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def parse_zeek_dns_log(log_path: str = None) -> dict:
+    """Parse a Zeek dns.log and persist every query through the detection pipeline."""
+    target = log_path or os.getenv("ZEEK_LOG_PATH") or DEFAULT_LOG
+
+    if not os.path.exists(target):
+        logger.error("Zeek log file not found: %s", target)
+        return {"processed": 0, "inserted": 0, "alerts": 0, "incidents": 0,
+                "skipped": 0, "status": "file_not_found"}
+
+    logger.info("Ingesting Zeek telemetry from: %s", target)
 
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
+    load_whitelist(cursor)
 
     fields = []
-    processed_count = 0
-    alert_count = 0
+    processed = inserted = alerts = incidents = skipped = 0
 
-    print(f"[*] Ingesting Zeek telemetry from: {LOG_PATH}")
+    try:
+        with open(target, "r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                line = line.rstrip("\n")
 
-    with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
+                if line.startswith("#fields"):
+                    fields = line.split("\t")[1:]
+                    continue
+                if not line or line.startswith("#") or not fields:
+                    continue
 
-            # Parse Zeek header to dynamically map columns
-            if line.startswith("#fields"):
-                fields = line.split("\t")[1:]
-                continue
-            if line.startswith("#") or not line or not fields:
-                continue
+                record = dict(zip(fields, line.split("\t")))
+                domain = record.get("query", UNSET).strip(".")
+                if not domain or domain == UNSET:
+                    continue
 
-            values = line.split("\t")
-            record = dict(zip(fields, values))
+                source_ip = record.get("id.orig_h", "0.0.0.0")
 
-            domain = record.get("query", "-")
-            src_ip = record.get("id.orig_h", "0.0.0.0")
-            
-            # Skip empty or unassigned DNS requests
-            if domain == "-" or not domain:
-                continue
+                try:
+                    timestamp = datetime.fromtimestamp(float(record.get("ts", "")))
+                except (TypeError, ValueError):
+                    timestamp = datetime.now()
 
-            # Parse query type and TTL safely
-            qtype_raw = record.get("qtype", "1")
-            qtype = int(qtype_raw) if qtype_raw.isdigit() else 1
+                qtype_raw = record.get("qtype", "1")
+                try:
+                    qtype = int(qtype_raw)
+                except (TypeError, ValueError):
+                    qtype = 1
+                if qtype == 41:  # EDNS0 OPT, not a query
+                    continue
 
-            ttls_raw = record.get("TTLs", "0").split(",")[0]
-            try:
-                ttl = int(float(ttls_raw))
-            except ValueError:
-                ttl = 0
+                qtype_name = record.get("qtype_name")
+                if qtype_name in (None, UNSET):
+                    qtype_name = None
 
-            # Feature extraction
-            query_length = len(domain)
-            labels = domain.split(".")
-            subdomain = ".".join(labels[:-2]) if len(labels) > 2 else ""
-            target_string = subdomain if subdomain else domain
+                processed += 1
+                try:
+                    result = ingest_record(
+                        cursor,
+                        domain=domain,
+                        query_type=qtype,
+                        source_ip=source_ip,
+                        timestamp=timestamp,
+                        ttl=_first_ttl(record.get("TTLs", UNSET)),
+                        qtype_name=qtype_name,
+                    )
+                    if result["inserted"]:
+                        inserted += 1
+                    else:
+                        skipped += 1
+                    if result["alert_id"]:
+                        alerts += 1
+                    if result["incident_id"]:
+                        incidents += 1
 
-            entropy = calculate_entropy(target_string)
-            risk_score, severity, indicators = evaluate_risk(query_length, entropy)
+                    if inserted and inserted % COMMIT_EVERY == 0:
+                        conn.commit()
 
-            # 1. Insert into dns_queries
-            cursor.execute("""
-                INSERT INTO dns_queries (source_ip, domain, query_type, ttl)
-                VALUES (%s, %s, %s, %s) RETURNING id;
-            """, (src_ip, domain, qtype, ttl))
-            query_id = cursor.fetchone()[0]
+                except Exception as exc:
+                    conn.rollback()
+                    logger.warning("Skipped malformed record (%s): %s", line[:70], exc)
 
-            # 2. Insert into dns_features
-            cursor.execute("""
-                INSERT INTO dns_features (query_id, query_length, entropy)
-                VALUES (%s, %s, %s);
-            """, (query_id, query_length, entropy))
+        conn.commit()
 
-            # 3. Create Alert if heuristic threshold is breached
-            if risk_score > 0:
-                reason = ", ".join(indicators)
-                cursor.execute("""
-                    INSERT INTO alerts (query_id, risk_score, severity, detection_reason, status)
-                    VALUES (%s, %s, %s, %s, 'OPEN') RETURNING id;
-                """, (query_id, risk_score, severity, reason))
-                alert_id = cursor.fetchone()[0]
-                alert_count += 1
+    finally:
+        cursor.close()
+        conn.close()
 
-                # 4. Escalate High/Critical severities to incidents
-                if severity in ["High", "Critical"]:
-                    cursor.execute("""
-                        INSERT INTO incidents (alert_id, source_ip, domain, severity, status)
-                        VALUES (%s, %s, %s, %s, 'INVESTIGATING');
-                    """, (alert_id, src_ip, domain, severity))
+    logger.info("Zeek ingestion complete: %d records, %d inserted, %d duplicates skipped",
+                processed, inserted, skipped)
+    logger.info("Alerts generated: %d | Incidents escalated: %d", alerts, incidents)
 
-            processed_count += 1
+    return {
+        "processed": processed,
+        "inserted": inserted,
+        "skipped": skipped,
+        "alerts": alerts,
+        "incidents": incidents,
+        "status": "success",
+    }
 
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"[+] Ingestion complete: {processed_count} DNS queries processed.")
-    print(f"[+] Alerts generated: {alert_count}")
 
 if __name__ == "__main__":
-    parse_zeek_dns_log()
+    parser = argparse.ArgumentParser(description="Import queries from a Zeek dns.log file.")
+    parser.add_argument("log", nargs="?", default=None, help="Path to dns.log (default: zeek/logs/dns.log)")
+    args = parser.parse_args()
+    parse_zeek_dns_log(args.log)

@@ -1,74 +1,117 @@
+"""
+PCAP ingestion: parse a capture file with Scapy and push every DNS query
+through the shared detection pipeline.
+"""
+
+import argparse
+import logging
 import os
+from datetime import datetime
+
 import psycopg2
 from scapy.all import PcapReader, DNS, DNSQR, IP
-from config import DB_CONFIG
-from utils import calculate_entropy, evaluate_risk
 
-def analyze_pcap(pcap_path):
-    print("Connecting to database and analyzing traffic...")
+from config import DB_CONFIG
+from ingest import ingest_record, load_whitelist
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+COMMIT_EVERY = 500  # commit in batches; per-packet commits dominated runtime
+
+DEFAULT_PCAP = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "datasets", "suspicious", "test_traffic.pcap")
+)
+
+
+def analyze_pcap(pcap_path: str = None) -> dict:
+    """
+    Parse a PCAP, extract DNS telemetry, score it and persist the results.
+
+    Returns a summary dict. Re-running on the same file is safe: duplicate
+    queries are skipped by the unique index rather than inserted twice.
+    """
+    path = pcap_path or DEFAULT_PCAP
+
+    if not os.path.exists(path):
+        logger.error("PCAP file not found: %s", path)
+        return {"processed": 0, "inserted": 0, "alerts": 0, "incidents": 0,
+                "skipped": 0, "status": "file_not_found"}
+
+    logger.info("Analyzing PCAP capture: %s", path)
+
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
-    
-    with PcapReader(pcap_path) as packets:
-        for pkt in packets:
-            if pkt.haslayer(DNS) and pkt.haslayer(DNSQR) and pkt.haslayer(IP):
-                try:
-                    src_ip = pkt[IP].src
-                    ttl = pkt[IP].ttl
-                    qtype = pkt[DNSQR].qtype
-                    
-                    qname_bytes = pkt[DNSQR].qname
-                    domain = qname_bytes.decode('utf-8', errors='ignore').strip('.')
-                    query_length = len(domain)
-                    
-                    labels = domain.split('.')
-                    subdomain = '.'.join(labels[:-2]) if len(labels) > 2 else ""
-                    target_string = subdomain if subdomain else domain
-                    
-                    entropy = calculate_entropy(target_string)
-                    score, severity, indicators = evaluate_risk(query_length, entropy)
-                    
-                    # 1. Insert into dns_queries table
-                    cursor.execute("""
-                        INSERT INTO dns_queries (source_ip, domain, query_type, ttl)
-                        VALUES (%s, %s, %s, %s) RETURNING id;
-                    """, (src_ip, domain, qtype, ttl))
-                    query_id = cursor.fetchone()[0]
-                    
-                    # 2. Insert into dns_features table
-                    cursor.execute("""
-                        INSERT INTO dns_features (query_id, query_length, entropy)
-                        VALUES (%s, %s, %s);
-                    """, (query_id, query_length, entropy))
-                    
-                    # 3. If suspicious, insert into alerts table
-                    if score > 0:
-                        reason = ", ".join(indicators)
-                        cursor.execute("""
-                            INSERT INTO alerts (query_id, risk_score, severity, detection_reason, status)
-                            VALUES (%s, %s, %s, %s, 'OPEN') RETURNING id;
-                        """, (query_id, score, severity, reason))
-                        alert_id = cursor.fetchone()[0]
-                        
-                        # 4. If High or Critical, automatically open an incident
-                        if severity in ["High", "Critical"]:
-                            cursor.execute("""
-                                INSERT INTO incidents (alert_id, source_ip, domain, severity, status)
-                                VALUES (%s, %s, %s, %s, 'INVESTIGATING');
-                            """, (alert_id, src_ip, domain, severity))
-                            
-                    conn.commit()
-                except Exception as e:
-                    conn.rollback()
-                    print(f"[!] Error processing packet: {e}")
+    load_whitelist(cursor)
+
+    processed = inserted = alerts = incidents = skipped = 0
+
+    try:
+        with PcapReader(path) as packets:
+            for pkt in packets:
+                if not (pkt.haslayer(DNS) and pkt.haslayer(DNSQR) and pkt.haslayer(IP)):
                     continue
-                    
-    cursor.close()
-    conn.close()
-    print("Analysis complete. Threats and traffic saved to PostgreSQL!")
+
+                processed += 1
+                try:
+                    qname = pkt[DNSQR].qname
+                    if isinstance(qname, bytes):
+                        qname = qname.decode("utf-8", errors="ignore")
+                    domain = (qname or "").strip(".")
+                    if not domain:
+                        continue
+
+                    qtype = int(pkt[DNSQR].qtype)
+                    if qtype == 41:  # EDNS0 OPT pseudo-record, not a real query
+                        continue
+
+                    result = ingest_record(
+                        cursor,
+                        domain=domain,
+                        query_type=qtype,
+                        source_ip=pkt[IP].src,
+                        timestamp=datetime.fromtimestamp(float(pkt.time)),
+                        ttl=int(pkt[IP].ttl),
+                    )
+
+                    if result["inserted"]:
+                        inserted += 1
+                    else:
+                        skipped += 1
+                    if result["alert_id"]:
+                        alerts += 1
+                    if result["incident_id"]:
+                        incidents += 1
+
+                    if inserted and inserted % COMMIT_EVERY == 0:
+                        conn.commit()
+
+                except Exception as exc:
+                    conn.rollback()
+                    logger.warning("Error processing packet: %s", exc)
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
+
+    logger.info("PCAP analysis complete: %d DNS packets, %d inserted, %d duplicates skipped",
+                processed, inserted, skipped)
+    logger.info("Alerts generated: %d | Incidents escalated: %d", alerts, incidents)
+
+    return {
+        "processed": processed,
+        "inserted": inserted,
+        "skipped": skipped,
+        "alerts": alerts,
+        "incidents": incidents,
+        "status": "success",
+    }
+
 
 if __name__ == "__main__":
-    # Resolve path relative to this script's location, works on both Linux and Windows
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    pcap_path = os.path.join(base_dir, "..", "datasets", "suspicious", "test_traffic.pcap")
-    analyze_pcap(os.path.normpath(pcap_path))
+    parser = argparse.ArgumentParser(description="Import DNS queries from a PCAP file.")
+    parser.add_argument("pcap", nargs="?", default=None, help="Path to a .pcap file (default: bundled sample)")
+    args = parser.parse_args()
+    analyze_pcap(args.pcap)
