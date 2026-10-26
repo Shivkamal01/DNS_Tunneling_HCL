@@ -8,9 +8,9 @@ const client = axios.create({ baseURL: API_BASE, timeout: DEFAULT_TIMEOUT });
 /**
  * Normalise backend errors into a single string the UI can display.
  *
- * The API returns {"error": {"message", "detail"}} on failure and FastAPI
- * returns {"detail": ...} for validation errors, so check both shapes before
- * falling back to the axios message.
+ * The API returns {"error": {"message", "detail"}} for application, validation,
+ * and routing failures. The {"detail": ...} branches are kept for older builds
+ * and reverse proxies that synthesise their own error body.
  */
 export function describeError(error) {
   const payload = error?.response?.data;
@@ -22,6 +22,9 @@ export function describeError(error) {
   if (typeof payload?.detail === 'string') return payload.detail;
   if (Array.isArray(payload?.detail) && payload.detail[0]?.msg) return payload.detail[0].msg;
   if (error?.code === 'ECONNABORTED') return 'Request timed out';
+  if (error?.code === 'ERR_NETWORK' || error?.message === 'Network Error') {
+    return 'Cannot reach the detection API';
+  }
   return error?.message || 'Unexpected error';
 }
 

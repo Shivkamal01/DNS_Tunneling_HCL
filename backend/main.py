@@ -9,10 +9,10 @@ import os
 from datetime import datetime
 
 import psycopg2
-from scapy.all import PcapReader, DNS, DNSQR, IP
+from scapy.all import PcapReader, DNS, DNSQR, IP, IPv6
 
 from config import DB_CONFIG
-from ingest import ingest_record, load_whitelist
+from ingest import ingest_record_safe, load_whitelist
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ def analyze_pcap(pcap_path: str = None) -> dict:
     if not os.path.exists(path):
         logger.error("PCAP file not found: %s", path)
         return {"processed": 0, "inserted": 0, "alerts": 0, "incidents": 0,
-                "skipped": 0, "status": "file_not_found"}
+                "skipped": 0, "failed": 0, "status": "file_not_found"}
 
     logger.info("Analyzing PCAP capture: %s", path)
 
@@ -44,14 +44,24 @@ def analyze_pcap(pcap_path: str = None) -> dict:
     cursor = conn.cursor()
     load_whitelist(cursor)
 
-    processed = inserted = alerts = incidents = skipped = 0
+    processed = inserted = alerts = incidents = skipped = failed = 0
 
     try:
         with PcapReader(path) as packets:
             for pkt in packets:
-                if not (pkt.haslayer(DNS) and pkt.haslayer(DNSQR) and pkt.haslayer(IP)):
+                if not (
+                    pkt.haslayer(DNS)
+                    and pkt.haslayer(DNSQR)
+                    and (pkt.haslayer(IP) or pkt.haslayer(IPv6))
+                ):
+                    continue
+                # A capture contains both queries and responses. Only requests
+                # belong in dns_queries; adding responses creates phantom
+                # "queries" attributed to the resolver's IP address.
+                if int(getattr(pkt[DNS], "qr", 0) or 0) != 0:
                     continue
 
+                ip_layer = pkt[IP] if pkt.haslayer(IP) else pkt[IPv6]
                 processed += 1
                 try:
                     qname = pkt[DNSQR].qname
@@ -59,19 +69,20 @@ def analyze_pcap(pcap_path: str = None) -> dict:
                         qname = qname.decode("utf-8", errors="ignore")
                     domain = (qname or "").strip(".")
                     if not domain:
+                        skipped += 1
                         continue
 
                     qtype = int(pkt[DNSQR].qtype)
                     if qtype == 41:  # EDNS0 OPT pseudo-record, not a real query
+                        skipped += 1
                         continue
 
-                    result = ingest_record(
+                    result = ingest_record_safe(
                         cursor,
                         domain=domain,
                         query_type=qtype,
-                        source_ip=pkt[IP].src,
+                        source_ip=ip_layer.src,
                         timestamp=datetime.fromtimestamp(float(pkt.time)),
-                        ttl=int(pkt[IP].ttl),
                     )
 
                     if result["inserted"]:
@@ -83,11 +94,13 @@ def analyze_pcap(pcap_path: str = None) -> dict:
                     if result["incident_id"]:
                         incidents += 1
 
-                    if inserted and inserted % COMMIT_EVERY == 0:
+                    if processed % COMMIT_EVERY == 0:
                         conn.commit()
 
                 except Exception as exc:
-                    conn.rollback()
+                    # ingest_record_safe() rolled back only this record; keep
+                    # every query already staged in the current transaction.
+                    failed += 1
                     logger.warning("Error processing packet: %s", exc)
 
         conn.commit()
@@ -96,14 +109,15 @@ def analyze_pcap(pcap_path: str = None) -> dict:
         cursor.close()
         conn.close()
 
-    logger.info("PCAP analysis complete: %d DNS packets, %d inserted, %d duplicates skipped",
-                processed, inserted, skipped)
+    logger.info("PCAP analysis complete: %d DNS query packets, %d inserted, %d skipped, %d failed",
+                processed, inserted, skipped, failed)
     logger.info("Alerts generated: %d | Incidents escalated: %d", alerts, incidents)
 
     return {
         "processed": processed,
         "inserted": inserted,
         "skipped": skipped,
+        "failed": failed,
         "alerts": alerts,
         "incidents": incidents,
         "status": "success",

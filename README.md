@@ -14,6 +14,8 @@ DNS is the one protocol almost every network allows out through the firewall. Th
 - [Project layout](#project-layout)
 - [Setup](#setup)
 - [Running the platform](#running-the-platform)
+- [Tests](#tests)
+- [Timestamps and SLAs](#timestamps-and-slas)
 - [API reference](#api-reference)
 - [Dashboard](#dashboard)
 - [Limitations and known gaps](#limitations-and-known-gaps)
@@ -153,19 +155,26 @@ DNS_Tunneling_HCL/
 │   ├── zeek_ingest.py    Zeek dns.log parser
 │   ├── utils.py          Feature extraction and risk scoring
 │   ├── config.py         Database configuration from environment
+│   ├── .env.example      Safe local environment template
+│   ├── tests/            Scoring, validation and API regression tests
 │   └── requirements.txt
 ├── frontend/
 │   └── src/
 │       ├── App.js                     State, routing between views, refresh loop
 │       ├── App.css                    Operator-console theme
 │       ├── services/api.js            Axios client and offline fallback data
+│       ├── utils/
+│       │   ├── format.js              UTC formatting, SLA clocks, byte/IP helpers
+│       │   ├── overlay.js             Focus trap, scroll lock, Escape/focus return
+│       │   └── techniques.js          MITRE ATT&CK mappings
 │       └── components/
-│           ├── Header.jsx             Status, refresh, actions, export menu
+│           ├── Header.jsx             Status, UTC clock, refresh, actions, export menu
 │           ├── MetricsOverview.jsx    Five-metric summary strip
-│           ├── ThreatAnalytics.jsx    Severity mix, timeline, top targets
+│           ├── ThreatAnalytics.jsx    Severity mix, UTC timeline, top targets
 │           ├── AlertsTable.jsx        Filterable triage table
-│           ├── ForensicDrawer.jsx     Per-alert deep inspection
+│           ├── ForensicDrawer.jsx     Per-alert deep inspection and triage
 │           ├── IncidentsView.jsx      Escalated incident queue
+│           ├── IncidentDrawer.jsx     Case detail, ownership and linked alert
 │           ├── WhitelistView.jsx      Rule management with live scoring preview
 │           ├── TelemetryStreamModal.jsx  Polling raw query stream
 │           └── TrafficSimulatorModal.jsx Scenario injection and file import
@@ -286,7 +295,29 @@ ZEEK_LOG_PATH=/var/log/zeek/dns.log python zeek_ingest.py
 
 3. From the dashboard: **Simulate** → choose a scenario, or use the file-import buttons.
 
-If PostgreSQL is unreachable, the dashboard falls back to a bundled sample data set and labels the connection state `Offline · sample data`. The status pill never claims to be live when it isn't.
+If PostgreSQL is unreachable, the dashboard falls back to a bundled sample data set and labels the connection state `Offline · local data`. The status pill never claims to be live when it isn't.
+
+### Tests
+
+```bash
+# Backend: scoring engine, input validation, API contracts
+python -m unittest discover -s backend/tests -v
+
+# Frontend: console shell smoke tests
+cd frontend
+CI=true npm test -- --watchAll=false
+
+# Production build (lint warnings fail in CI mode)
+CI=true npm run build
+```
+
+The backend suite uses temporary in-memory state where possible and does not need the API server running. The frontend tests mock the API and verify the dashboard renders without a live backend.
+
+### Timestamps and SLAs
+
+Database timestamps are stored as local `TIMESTAMP` values, but every datetime is serialised by the API as an explicit UTC instant. The console renders all timestamps, the header clock, and the activity timeline in UTC, so a browser in another timezone cannot silently shift alert history.
+
+Triage SLAs are critical 1h, high 4h, medium 24h, low 72h from alert creation. Terminal alerts and incidents stop the SLA clock instead of continuing to show as overdue. Status changes propagate between an alert and its linked incident, but notes do not: alert triage notes stay with the alert, and incident case notes are never overwritten by an alert edit.
 
 ---
 
@@ -298,27 +329,35 @@ All endpoints return JSON. Failures carry a real HTTP status and an error body:
 { "error": { "message": "Alert not found", "detail": "No alert with id 9999" } }
 ```
 
+### Health
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/health` | Verifies the database connection and returns version, process start time, and server time. |
+
 ### Alerts
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/alerts` | Paginated alert list. Filters: `severity`, `status`, `search`, `limit`, `offset`. Returns `total` for the current filter. |
 | `GET` | `/api/alerts/{id}` | Full forensic detail, including linked incidents. `404` if absent. |
-| `PUT` | `/api/alerts/{id}/status` | Update status and notes. Validates the status against the lifecycle enum and propagates to the linked incident. |
+| `PUT` | `/api/alerts/{id}/status` | Update status and alert triage notes. Validates the status against the lifecycle enum and propagates status to the linked incident; terminal incident states are not reopened, and incident notes are untouched. |
 
 ### Incidents
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/incidents` | Incident queue, ordered by triage priority then recency. Filters: `status`, `severity`. |
-| `PUT` | `/api/incidents/{id}` | Update status, assignee or notes. |
+| `PUT` | `/api/incidents/{id}` | Update status, assignee or case notes. Resolving or closing a case also resolves the parent alert; other status changes leave the alert lifecycle alone, and alert notes are untouched. |
+
+High and critical detections auto-open an incident in `OPEN`. There is no automatic ownership assignment; an analyst claims the case from the incident drawer.
 
 ### Telemetry
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/queries` | Most recent raw queries with features and verdicts. |
-| `GET` | `/api/metrics` | Aggregate totals, severity breakdown, top domains, top source IPs, and hourly activity for the 15 most recent buckets. |
+| `GET` | `/api/metrics` | Aggregate totals, active incident count, open-critical count, severity breakdown, top domains, top source IPs, and UTC hourly activity for the 15 most recent active hours. |
 | `POST` | `/api/analyze` | Score a single hostname without persisting it. `?domain=…&query_type=…` |
 
 ### Ingestion and simulation
@@ -329,15 +368,17 @@ All endpoints return JSON. Failures carry a real HTTP status and an error body:
 | `POST` | `/api/ingest/zeek` | Import `zeek/logs/dns.log`. |
 | `POST` | `/api/ingest/pcap` | Import the bundled PCAP. |
 
-Ingestion responses report `inserted`, `skipped`, `alerts` and `incidents`, so duplicates are visible rather than silent.
+Ingestion responses report `inserted`, `skipped`, `alerts`, `incidents` and `failed`, so duplicates and per-record errors are visible rather than silent. A single malformed record does not roll back the rest of the batch. The PCAP importer reads IPv4 and IPv6 client queries only; response packets are ignored so resolver addresses do not appear as clients, and empty names or EDNS0 pseudo-records are reported as skipped.
 
 ### Whitelist
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/whitelist` | All rules. |
-| `POST` | `/api/whitelist` | Add a rule. Takes effect immediately — the in-memory rule cache is refreshed on write. |
+| `POST` | `/api/whitelist` | Add a concrete domain suffix. Takes effect immediately — the in-memory rule cache is refreshed on write. Wildcards and malformed patterns are rejected. |
 | `DELETE` | `/api/whitelist/{pattern}` | Remove a rule. |
+
+The bundled default rules are inserted only when the `whitelist` table is first created. Deleting a default is permanent across restarts; an empty table is not silently re-seeded.
 
 ### Export
 
@@ -350,17 +391,17 @@ Ingestion responses report `inserted`, `skipped`, `alerts` and `incidents`, so d
 
 ## Dashboard
 
-The console has three views.
+The console has three hash-routed views (`#/alerts`, `#/incidents`, `#/whitelist`), so browser back/forward and copied links land on the same view. An offline banner appears when the API cannot be reached; the console keeps the last known data rather than blanking the table.
 
-**Alerts** — five-metric summary, three charts, and the triage table. The table filters by severity and status, searches across domains, IPs and indicators, sorts on any column, and toggles between normal and compact row density. Changing a status is optimistic: the row updates immediately and rolls back if the write fails.
+**Alerts** — open-critical and queue metrics, severity mix, UTC activity timeline, top targets, and the triage table. The table filters by severity and status, searches across domains, IPs and indicators, sorts on any column, and toggles between normal and compact row density. Each row carries a triage-SLA indicator. Changing a status is optimistic: the row updates immediately and rolls back if the write fails. The telemetry stream opens the same forensic drawer as the table.
 
-**Incidents** — the escalated queue, ordered by triage priority. Status can be changed inline; clicking an unassigned row takes ownership.
+**Incidents** — the escalated queue, ordered by triage priority and filtered by status, severity, or free text. Status can be changed inline; opening a row shows the case drawer with ownership, SLA, network context, the linked alert, and analyst notes. Assignment is explicit (`Assign to me` or the owner field), not a side effect of clicking a row.
 
-**Whitelist** — add and remove suppression rules. Typing a pattern scores it live through `/api/analyze`, so you can see what you are about to suppress before committing the rule.
+**Whitelist** — add and remove suppression rules. Patterns are validated in the browser and on the server; wildcards are rejected. Typing a pattern scores it live through `/api/analyze`, so you can see what you are about to suppress before committing the rule. Delete uses an inline confirmation.
 
-The forensic drawer (click any alert) shows the full feature vector, a length-normalised entropy meter, decoded payload where one can be recovered, the triggered indicators, pivot links to VirusTotal / Shodan / AbuseIPDB, and the triage form.
+The forensic drawer (click any alert, or press Enter on a focused row) shows the full feature vector, a length-normalised entropy meter, decoded payload where one can be recovered, the triggered indicators, MITRE ATT&CK technique tags, linked incidents, UTC timestamps, pivot links to VirusTotal / Shodan / AbuseIPDB, and the triage form. Unsaved edits prompt before closing, Escape works, focus is trapped while open, and focus returns to the triggering row on close.
 
-Keyboard: `Ctrl`/`Cmd`+`K` focuses search, `Esc` closes the drawer or any modal.
+Keyboard: `Ctrl`/`Cmd`+`K` focuses alert search (the Alerts view), `Enter`/`Space` opens a focused table or incident row, and `Esc` closes the drawer or any modal.
 
 ---
 
@@ -376,7 +417,9 @@ These are real and worth stating plainly.
 
 **The apex split is a heuristic.** `extract_dns_features` assumes the last two labels are the registrable domain. That is wrong for multi-part public suffixes (`example.co.uk`, `shop.example.com.au`), where it will misattribute the subdomain. A public-suffix list would fix it.
 
-**The whitelist matches suffixes only.** There is no wildcard or regex support; a rule for `example.com` covers every subdomain, which may be broader than an analyst intends.
+**The whitelist matches suffixes only.** There is no wildcard or regex support; a rule for `example.com` covers every subdomain, which may be broader than an analyst intends. Wildcard patterns are rejected rather than silently treated as literal suffixes.
+
+**Timestamps assume the app server and PostgreSQL share a timezone.** The schema uses naive `TIMESTAMP` columns, and the API attaches the server-local offset when serialising them to UTC. That is correct for the bundled single-machine setup, but a deployment where the API writes local time while the database interprets a different session timezone would shift history. Migrating the columns to `TIMESTAMPTZ` is the durable fix.
 
 **No authentication.** The API binds to `127.0.0.1` and assumes a trusted local operator. Do not expose it to a network as-is.
 

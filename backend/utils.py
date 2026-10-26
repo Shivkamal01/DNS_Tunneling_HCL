@@ -62,9 +62,11 @@ DEFAULT_WHITELIST = [
     "akamaiedge.net",
     "akamai.net",
     "cloudfront.net",
+    "amazonaws.com",
     "azure.com",
     "windowsupdate.com",
     "microsoft.com",
+    "office365.com",
     "apple.com",
     "icloud.com",
     "github.com",
@@ -79,11 +81,17 @@ _whitelist_cache: List[str] = list(DEFAULT_WHITELIST)
 
 
 def set_whitelist(patterns: Sequence[str]) -> None:
-    """Replace the active whitelist with `patterns` merged over the defaults."""
+    """
+    Replace the active whitelist with the rules loaded from the database.
+
+    The schema seeds DEFAULT_WHITELIST on first run, so a successful load is
+    authoritative: deleting a seeded rule must actually stop suppressing it.
+    The built-in list remains in effect only while the database is unreachable.
+    """
     global _whitelist_cache
-    merged = {p.strip().strip(".").lower() for p in DEFAULT_WHITELIST if p}
-    merged.update(p.strip().strip(".").lower() for p in patterns if p)
-    _whitelist_cache = sorted(merged)
+    _whitelist_cache = sorted(
+        {p.strip().strip(".").lower() for p in patterns if p and p.strip()}
+    )
 
 
 def get_whitelist() -> List[str]:
@@ -116,7 +124,12 @@ def normalized_entropy(entropy: float, sample_length: int) -> float:
     """
     if sample_length < 2:
         return 0.0
-    ceiling = math.log2(min(sample_length, 37))  # 37 distinct chars covers a-z0-9
+    # A hostname label is drawn from a-z, 0-9 and '-' (37 symbols), so
+    # log2(37) is the realistic character-set ceiling. Using the RFC label
+    # length (63 octets) instead would mark a 60-character base32 payload at
+    # ~0.84 no matter how random it is, hiding exactly the long labels the
+    # detector is meant to catch.
+    ceiling = math.log2(min(sample_length, 37))
     if ceiling <= 0:
         return 0.0
     return round(min(entropy / ceiling, 1.0), 4)
@@ -380,7 +393,7 @@ def evaluate_risk(features: Dict[str, Any]) -> Tuple[int, str, List[str]]:
 
     score = min(score, 100)
 
-    # Calibrated against the benign/malicious corpus in tests/engine_test.py:
+    # Calibrated against the benign/malicious corpus in backend/tests/test_engine.py:
     # worst observed benign query scores 35, weakest true tunnel scores 53.
     if score <= 29:
         severity = "Low"

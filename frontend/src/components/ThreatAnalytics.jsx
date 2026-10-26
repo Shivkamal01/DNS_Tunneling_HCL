@@ -1,9 +1,10 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   ResponsiveContainer, PieChart, Pie, Cell, Tooltip,
   AreaChart, Area, XAxis, YAxis, CartesianGrid,
   BarChart, Bar,
 } from 'recharts';
+import { formatDateTime } from '../utils/format';
 
 const SEVERITY_COLORS = {
   CRITICAL: '#d3564f',
@@ -12,8 +13,28 @@ const SEVERITY_COLORS = {
   LOW:      '#7fa583',
 };
 
-const AXIS_STYLE = { fill: '#6b6b76', fontSize: 10, fontFamily: 'IBM Plex Mono, monospace' };
-const GRID_COLOR = '#1a1a1f';
+const AXIS_STYLE = { fill: '#777782', fontSize: 10, fontFamily: 'IBM Plex Mono, monospace' };
+const GRID_COLOR = '#1c1c22';
+
+function bucketLabel(value) {
+  // API buckets are ISO-8601 UTC instants. Keep chart ticks in the same zone
+  // as every other timestamp in the console, and include the date because a
+  // quiet network can leave multi-day gaps between non-empty buckets.
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || '');
+  const year = String(date.getUTCFullYear()).slice(-2);
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const hour = String(date.getUTCHours()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hour}:00`;
+}
+
+function bucketFullLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || '');
+  return `${formatDateTime(date)} UTC`;
+}
+
 
 function PieTooltip({ active, payload }) {
   if (!active || !payload?.length) return null;
@@ -36,7 +57,7 @@ function TimelineTooltip({ active, payload, label }) {
   const point = payload[0].payload;
   return (
     <div className="chart-tooltip">
-      <div className="tooltip-title">{label}</div>
+      <div className="tooltip-title">{point.fullTime || label}</div>
       <div className="tooltip-row">
         <span>Alerts</span>
         <strong>{point.count}</strong>
@@ -51,12 +72,12 @@ function TimelineTooltip({ active, payload, label }) {
   );
 }
 
-function DomainTooltip({ active, payload }) {
+function TargetTooltip({ active, payload }) {
   if (!active || !payload?.length) return null;
   const point = payload[0].payload;
   return (
     <div className="chart-tooltip">
-      <div className="tooltip-title mono">{point.fullDomain}</div>
+      <div className="tooltip-title mono">{point.fullName}</div>
       <div className="tooltip-row">
         <span>Alerts</span>
         <strong>{point.count}</strong>
@@ -72,6 +93,8 @@ function DomainTooltip({ active, payload }) {
 }
 
 export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
+  const [targetMode, setTargetMode] = useState('domains');
+
   /**
    * Severity split. Prefer the server-side breakdown, which covers every alert
    * in the database — deriving it from the loaded page made the donut disagree
@@ -101,7 +124,8 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
   const timelineData = useMemo(() => {
     if (metricsData?.timeline?.length) {
       return metricsData.timeline.map((bucket) => ({
-        time: bucket.time_bucket,
+        time: bucketLabel(bucket.time_bucket),
+        fullTime: bucketFullLabel(bucket.time_bucket),
         count: parseInt(bucket.alert_count, 10) || 0,
         avgRisk: bucket.avg_risk !== undefined ? parseInt(bucket.avg_risk, 10) : undefined,
       }));
@@ -113,19 +137,52 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
       .forEach((alert) => {
         if (!alert.created_at) return;
         const date = new Date(alert.created_at);
-        const key = `${String(date.getHours()).padStart(2, '0')}:00`;
+        if (Number.isNaN(date.getTime())) return;
+        const key = new Date(Date.UTC(
+          date.getUTCFullYear(),
+          date.getUTCMonth(),
+          date.getUTCDate(),
+          date.getUTCHours(),
+        )).toISOString();
         buckets[key] = (buckets[key] || 0) + 1;
       });
     return Object.entries(buckets)
-      .map(([time, count]) => ({ time, count }))
-      .slice(-12);
+      .map(([time, count]) => ({
+        time: bucketLabel(time),
+        fullTime: bucketFullLabel(time),
+        count,
+      }))
+      .slice(-15);
   }, [alerts, metricsData]);
 
-  const topDomainsData = useMemo(() => {
+  const targetsData = useMemo(() => {
+    if (targetMode === 'ips') {
+      if (metricsData?.top_ips?.length) {
+        return metricsData.top_ips.map((entry) => ({
+          label: entry.source_ip || 'unknown',
+          fullName: entry.source_ip || 'unknown source',
+          count: parseInt(entry.alert_count, 10) || 0,
+          risk: parseInt(entry.max_risk, 10) || 0,
+        }));
+      }
+
+      const byIp = {};
+      alerts.forEach((alert) => {
+        const ip = alert.source_ip || 'unknown';
+        byIp[ip] = byIp[ip] || { count: 0, risk: 0 };
+        byIp[ip].count += 1;
+        byIp[ip].risk = Math.max(byIp[ip].risk, alert.risk_score || 0);
+      });
+      return Object.entries(byIp)
+        .map(([ip, info]) => ({ label: ip, fullName: ip, count: info.count, risk: info.risk }))
+        .sort((a, b) => b.count - a.count || b.risk - a.risk)
+        .slice(0, 5);
+    }
+
     if (metricsData?.top_domains?.length) {
       return metricsData.top_domains.map((entry) => ({
         label: entry.domain.length > 26 ? `${entry.domain.slice(0, 24)}…` : entry.domain,
-        fullDomain: entry.domain,
+        fullName: entry.domain,
         count: parseInt(entry.query_count, 10) || 0,
         risk: parseInt(entry.max_risk, 10) || 0,
       }));
@@ -142,13 +199,13 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
     return Object.entries(byDomain)
       .map(([domain, info]) => ({
         label: domain.length > 26 ? `${domain.slice(0, 24)}…` : domain,
-        fullDomain: domain,
+        fullName: domain,
         count: info.count,
         risk: info.risk,
       }))
       .sort((a, b) => b.count - a.count || b.risk - a.risk)
       .slice(0, 5);
-  }, [alerts, metricsData]);
+  }, [alerts, metricsData, targetMode]);
 
   const renderEmpty = (message, height = 200) => (
     <div className="chart-empty" style={{ minHeight: height }}>{message}</div>
@@ -172,26 +229,32 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
             renderEmpty('No alerts recorded')
           ) : (
             <>
-              <ResponsiveContainer width="100%" height={172}>
-                <PieChart>
-                  <Pie
-                    data={pieData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={52}
-                    outerRadius={78}
-                    paddingAngle={2}
-                    dataKey="value"
-                    stroke="none"
-                    isAnimationActive={false}
-                  >
-                    {pieData.map((entry) => (
-                      <Cell key={entry.name} fill={SEVERITY_COLORS[entry.name] || SEVERITY_COLORS.MEDIUM} />
-                    ))}
-                  </Pie>
-                  <Tooltip content={<PieTooltip />} />
-                </PieChart>
-              </ResponsiveContainer>
+              <div className="donut-wrap">
+                <ResponsiveContainer width="100%" height={172}>
+                  <PieChart>
+                    <Pie
+                      data={pieData}
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={52}
+                      outerRadius={78}
+                      paddingAngle={2}
+                      dataKey="value"
+                      stroke="none"
+                      isAnimationActive={false}
+                    >
+                      {pieData.map((entry) => (
+                        <Cell key={entry.name} fill={SEVERITY_COLORS[entry.name] || SEVERITY_COLORS.MEDIUM} />
+                      ))}
+                    </Pie>
+                    <Tooltip content={<PieTooltip />} />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="donut-center" aria-hidden="true">
+                  <strong>{totalForLegend}</strong>
+                  <span>alerts</span>
+                </div>
+              </div>
 
               <div className="severity-legend">
                 {['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].map((severity) => {
@@ -219,7 +282,7 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
         <div className="panel-header">
           <div>
             <h3>Detection activity</h3>
-            <p className="panel-sub">Alert volume per hour, most recent 15 buckets</p>
+            <p className="panel-sub">Alert volume in the 15 most recent active hours (UTC)</p>
           </div>
         </div>
 
@@ -230,7 +293,7 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
             renderEmpty('No activity recorded yet', 240)
           ) : (
             <ResponsiveContainer width="100%" height={258}>
-              <AreaChart data={timelineData} margin={{ top: 8, right: 8, left: -22, bottom: 4 }}>
+              <AreaChart data={timelineData} margin={{ top: 8, right: 36, left: 0, bottom: 4 }}>
                 <defs>
                   <linearGradient id="activityGrad" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="#d9a04a" stopOpacity={0.26} />
@@ -262,6 +325,7 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
                   fill="url(#activityGrad)"
                   dot={false}
                   activeDot={{ r: 3, fill: '#d9a04a', stroke: '#0a0a0b', strokeWidth: 2 }}
+                  isAnimationActive={false}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -274,19 +338,33 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
         <div className="panel-header">
           <div>
             <h3>Top targets</h3>
-            <p className="panel-sub">Hostnames generating the most alerts</p>
+            <p className="panel-sub">Hostnames or source clients generating the most alerts</p>
+          </div>
+          <div className="panel-toggle" role="group" aria-label="Top targets grouping">
+            {[
+              { key: 'domains', label: 'Domains' },
+              { key: 'ips', label: 'Sources' },
+            ].map((option) => (
+              <button
+                key={option.key}
+                className={targetMode === option.key ? 'active' : ''}
+                onClick={() => setTargetMode(option.key)}
+              >
+                {option.label}
+              </button>
+            ))}
           </div>
         </div>
 
         <div className="chart-wrapper">
           {isLoading ? (
             <div className="chart-skeleton" style={{ height: 240 }} />
-          ) : topDomainsData.length === 0 ? (
+          ) : targetsData.length === 0 ? (
             renderEmpty('No suspicious targets detected', 240)
           ) : (
             <ResponsiveContainer width="100%" height={258}>
               <BarChart
-                data={topDomainsData}
+                data={targetsData}
                 layout="vertical"
                 margin={{ top: 4, right: 12, left: 4, bottom: 4 }}
               >
@@ -306,11 +384,16 @@ export function ThreatAnalytics({ alerts, metricsData, isLoading }) {
                   tickLine={false}
                   width={124}
                 />
-                <Tooltip content={<DomainTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
-                <Bar dataKey="count" barSize={12} radius={[0, 1, 1, 0]}>
-                  {topDomainsData.map((entry) => (
+                <Tooltip content={<TargetTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+                <Bar
+                  dataKey="count"
+                  barSize={12}
+                  radius={[0, 1, 1, 0]}
+                  isAnimationActive={false}
+                >
+                  {targetsData.map((entry) => (
                     <Cell
-                      key={entry.fullDomain}
+                      key={entry.fullName}
                       fill={entry.risk >= 80 ? SEVERITY_COLORS.CRITICAL : entry.risk >= 55 ? SEVERITY_COLORS.HIGH : SEVERITY_COLORS.MEDIUM}
                     />
                   ))}

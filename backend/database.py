@@ -5,6 +5,7 @@ Run directly to create or migrate tables:  python database.py
 """
 
 import logging
+import sys
 
 import psycopg2
 
@@ -88,7 +89,7 @@ DDL = [
         source_ip VARCHAR(50),
         domain VARCHAR(255),
         severity VARCHAR(20),
-        status VARCHAR(20) DEFAULT 'INVESTIGATING',
+        status VARCHAR(20) DEFAULT 'OPEN',
         assigned_to VARCHAR(100) DEFAULT 'Unassigned',
         analyst_notes TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -121,6 +122,7 @@ MIGRATIONS = [
     "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS assigned_to VARCHAR(100) DEFAULT 'Unassigned';",
     "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS analyst_notes TEXT DEFAULT '';",
     "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
+    "ALTER TABLE incidents ALTER COLUMN status SET DEFAULT 'OPEN';",
     # Drop the old column whose name advertised a measure it did not compute.
     # base32_ratio was ~1.0 for every lowercase hostname; see utils.py.
     "ALTER TABLE dns_features DROP COLUMN IF EXISTS base32_ratio;",
@@ -145,6 +147,7 @@ ON dns_queries (timestamp, source_ip, domain, query_type);
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_dns_queries_timestamp ON dns_queries (timestamp DESC);",
+    "CREATE INDEX IF NOT EXISTS ix_dns_queries_domain ON dns_queries (domain);",
     "CREATE INDEX IF NOT EXISTS ix_alerts_created_at ON alerts (created_at DESC);",
     "CREATE INDEX IF NOT EXISTS ix_alerts_severity ON alerts (severity);",
     "CREATE INDEX IF NOT EXISTS ix_alerts_status ON alerts (status);",
@@ -155,6 +158,27 @@ INDEXES = [
 ]
 
 
+def _apply_step(conn, cursor, statement: str, label: str) -> bool:
+    """
+    Run one optional DDL step inside a savepoint.
+
+    A failed statement aborts the whole PostgreSQL transaction. The previous
+    implementation called conn.rollback() here, which silently discarded every
+    DDL statement and migration that had already succeeded in the same run.
+    A savepoint confines the failure to the step that caused it.
+    """
+    cursor.execute("SAVEPOINT schema_step;")
+    try:
+        cursor.execute(statement)
+        cursor.execute("RELEASE SAVEPOINT schema_step;")
+        return True
+    except Exception as exc:
+        cursor.execute("ROLLBACK TO SAVEPOINT schema_step;")
+        cursor.execute("RELEASE SAVEPOINT schema_step;")
+        logger.warning("%s skipped (%s): %s", label, exc.__class__.__name__, str(exc).strip()[:120])
+        return False
+
+
 def init_db() -> bool:
     """Create or migrate every table. Returns True on success."""
     conn = None
@@ -163,31 +187,35 @@ def init_db() -> bool:
         conn.autocommit = False
         cursor = conn.cursor()
 
-        for statement in DDL:
-            cursor.execute(statement)
+        # Seed the default rules only on a genuine first run. Re-seeding an
+        # existing but empty table would resurrect rules an analyst deliberately
+        # deleted on the next start, defeating the database-backed whitelist.
+        cursor.execute("SELECT to_regclass('whitelist') IS NOT NULL;")
+        whitelist_existed = cursor.fetchone()[0]
 
-        for statement in MIGRATIONS:
-            try:
-                cursor.execute(statement)
-            except Exception as exc:
-                conn.rollback()
-                logger.warning("Migration skipped (%s): %s", exc.__class__.__name__, statement[:60])
-
-        try:
-            cursor.execute(DEDUPE_SQL)
-            cursor.execute(UNIQUE_INDEX_SQL)
-        except Exception as exc:
-            conn.rollback()
-            logger.warning("Could not enforce query de-duplication index: %s", exc)
-
-        for statement in INDEXES:
+        # Required table creation is not optional: fail fast with a useful log.
+        for index, statement in enumerate(DDL, start=1):
             try:
                 cursor.execute(statement)
             except Exception:
+                logger.exception("Required schema statement %d failed", index)
                 conn.rollback()
+                return False
 
-        cursor.execute("SELECT count(*) FROM whitelist;")
-        if cursor.fetchone()[0] == 0:
+        for statement in MIGRATIONS:
+            _apply_step(conn, cursor, statement, "Migration")
+
+        _apply_step(
+            conn,
+            cursor,
+            f"{DEDUPE_SQL}\n{UNIQUE_INDEX_SQL}",
+            "Query de-duplication index",
+        )
+
+        for statement in INDEXES:
+            _apply_step(conn, cursor, statement, "Index")
+
+        if not whitelist_existed:
             for pattern, reason in INITIAL_WHITELIST:
                 cursor.execute(
                     """
@@ -204,6 +232,8 @@ def init_db() -> bool:
         return True
 
     except Exception as exc:
+        if conn is not None:
+            conn.rollback()
         logger.error("Error connecting to database: %s", exc)
         return False
     finally:
@@ -212,4 +242,4 @@ def init_db() -> bool:
 
 
 if __name__ == "__main__":
-    init_db()
+    sys.exit(0 if init_db() else 1)

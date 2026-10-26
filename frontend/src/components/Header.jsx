@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ShieldIcon, RefreshIcon, PlayIcon, DownloadIcon,
-  TerminalIcon, LayersIcon,
+  TerminalIcon, LayersIcon, ClockIcon,
 } from './Icons';
+import { formatClock } from '../utils/format';
 
 function timeAgo(timestamp) {
   if (!timestamp) return '';
@@ -18,6 +19,7 @@ export function Header({
   lastUpdated,
   countdown,
   refreshInterval,
+  isLoading,
   isRefreshing,
   onRefresh,
   onOpenSimulator,
@@ -27,7 +29,13 @@ export function Header({
   onToggleDensity,
 }) {
   const [exportOpen, setExportOpen] = useState(false);
+  const [now, setNow] = useState(() => new Date());
   const exportRef = useRef(null);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Close the export menu on outside click or Escape.
   useEffect(() => {
@@ -52,7 +60,7 @@ export function Header({
   const statusLabel = connectionStatus === 'online'
     ? 'Live'
     : connectionStatus === 'offline'
-      ? 'Offline · sample data'
+      ? 'Offline · local data'
       : 'Connecting';
 
   return (
@@ -72,6 +80,12 @@ export function Header({
       </div>
 
       <div className="header-right">
+        <div className="header-clock" title={now.toLocaleString()}>
+          <ClockIcon size={12} />
+          <span className="mono">{formatClock(now)}</span>
+          <span className="header-clock-zone">UTC</span>
+        </div>
+
         <div className={`status-pill ${connectionStatus}`}>
           <span className="status-indicator-dot" />
           <span className="status-pill-label">{statusLabel}</span>
@@ -89,6 +103,14 @@ export function Header({
           <div className="refresh-bar-track">
             <div className="refresh-bar-fill" style={{ width: `${progressPct}%` }} />
           </div>
+        </div>
+
+        <div className="operator-chip" title="Local analyst session">
+          <span className="avatar avatar-sm">SA</span>
+          <span className="operator-copy">
+            <strong>SOC Analyst</strong>
+            <span>Tier 1 · on shift</span>
+          </span>
         </div>
 
         <div className="header-actions">
@@ -123,44 +145,16 @@ export function Header({
             </button>
 
             {exportOpen && (
-              <div
-                role="menu"
-                style={{
-                  position: 'absolute',
-                  top: 'calc(100% + 4px)',
-                  right: 0,
-                  minWidth: 140,
-                  zIndex: 400,
-                  background: 'var(--bg-panel)',
-                  border: '1px solid var(--rule-strong)',
-                  borderRadius: 'var(--radius)',
-                  boxShadow: '0 10px 28px rgba(0,0,0,0.55)',
-                  overflow: 'hidden',
-                }}
-              >
+              <div className="export-menu" role="menu">
                 {[
                   { format: 'csv', label: 'Download CSV' },
                   { format: 'json', label: 'Download JSON' },
                 ].map((option) => (
                   <button
                     key={option.format}
+                    className="export-menu-item"
                     role="menuitem"
                     onClick={() => { onExport(option.format); setExportOpen(false); }}
-                    style={{
-                      display: 'block',
-                      width: '100%',
-                      padding: '8px 11px',
-                      border: 'none',
-                      borderBottom: option.format === 'csv' ? '1px solid var(--rule-faint)' : 'none',
-                      background: 'transparent',
-                      color: 'var(--text-muted)',
-                      fontFamily: 'var(--font-sans)',
-                      fontSize: 11.5,
-                      textAlign: 'left',
-                      cursor: 'pointer',
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--bg-hover)'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                   >
                     {option.label}
                   </button>
@@ -181,11 +175,11 @@ export function Header({
           <button
             className="btn-action btn-icon-only"
             onClick={onRefresh}
-            disabled={isRefreshing}
+            disabled={isLoading || isRefreshing}
             title="Refresh now"
             aria-label="Refresh alerts"
           >
-            <RefreshIcon size={13} className={isRefreshing ? 'spin-anim' : ''} />
+            <RefreshIcon size={13} className={isLoading || isRefreshing ? 'spin-anim' : ''} />
           </button>
         </div>
       </div>

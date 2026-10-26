@@ -15,7 +15,7 @@ from datetime import datetime
 import psycopg2
 
 from config import DB_CONFIG
-from ingest import ingest_record, load_whitelist
+from ingest import ingest_record_safe, load_whitelist
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def parse_zeek_dns_log(log_path: str = None) -> dict:
     if not os.path.exists(target):
         logger.error("Zeek log file not found: %s", target)
         return {"processed": 0, "inserted": 0, "alerts": 0, "incidents": 0,
-                "skipped": 0, "status": "file_not_found"}
+                "skipped": 0, "failed": 0, "status": "file_not_found"}
 
     logger.info("Ingesting Zeek telemetry from: %s", target)
 
@@ -55,7 +55,7 @@ def parse_zeek_dns_log(log_path: str = None) -> dict:
     load_whitelist(cursor)
 
     fields = []
-    processed = inserted = alerts = incidents = skipped = 0
+    processed = inserted = alerts = incidents = skipped = failed = 0
 
     try:
         with open(target, "r", encoding="utf-8", errors="ignore") as handle:
@@ -94,7 +94,7 @@ def parse_zeek_dns_log(log_path: str = None) -> dict:
 
                 processed += 1
                 try:
-                    result = ingest_record(
+                    result = ingest_record_safe(
                         cursor,
                         domain=domain,
                         query_type=qtype,
@@ -112,11 +112,13 @@ def parse_zeek_dns_log(log_path: str = None) -> dict:
                     if result["incident_id"]:
                         incidents += 1
 
-                    if inserted and inserted % COMMIT_EVERY == 0:
+                    if processed % COMMIT_EVERY == 0:
                         conn.commit()
 
                 except Exception as exc:
-                    conn.rollback()
+                    # The savepoint keeps prior records; do not roll back the
+                    # whole batch for one malformed line.
+                    failed += 1
                     logger.warning("Skipped malformed record (%s): %s", line[:70], exc)
 
         conn.commit()
@@ -125,14 +127,15 @@ def parse_zeek_dns_log(log_path: str = None) -> dict:
         cursor.close()
         conn.close()
 
-    logger.info("Zeek ingestion complete: %d records, %d inserted, %d duplicates skipped",
-                processed, inserted, skipped)
+    logger.info("Zeek ingestion complete: %d records, %d inserted, %d duplicates skipped, %d failed",
+                processed, inserted, skipped, failed)
     logger.info("Alerts generated: %d | Incidents escalated: %d", alerts, incidents)
 
     return {
         "processed": processed,
         "inserted": inserted,
         "skipped": skipped,
+        "failed": failed,
         "alerts": alerts,
         "incidents": incidents,
         "status": "success",

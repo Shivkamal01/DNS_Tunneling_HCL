@@ -36,6 +36,25 @@ def load_whitelist(cursor) -> None:
         logger.warning("Could not load whitelist rules: %s", exc)
 
 
+def ingest_record_safe(cursor, **kwargs) -> Dict[str, Any]:
+    """
+    Call ingest_record() inside a savepoint.
+
+    A malformed record must not roll back every query imported since the last
+    batch commit. Callers catch the exception, log the bad row, and continue;
+    the savepoint rollback leaves earlier rows in the transaction intact.
+    """
+    cursor.execute("SAVEPOINT ingest_record;")
+    try:
+        result = ingest_record(cursor, **kwargs)
+    except Exception:
+        cursor.execute("ROLLBACK TO SAVEPOINT ingest_record;")
+        cursor.execute("RELEASE SAVEPOINT ingest_record;")
+        raise
+    cursor.execute("RELEASE SAVEPOINT ingest_record;")
+    return result
+
+
 def ingest_record(
     cursor,
     domain: str,
@@ -133,7 +152,7 @@ def ingest_record(
                 alert_id, source_ip, domain, severity, status,
                 assigned_to, analyst_notes, created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, 'INVESTIGATING', 'Unassigned',
+            VALUES (%s, %s, %s, %s, 'OPEN', 'Unassigned',
                     'Auto-escalated from detection engine', %s, %s) RETURNING id;
             """,
             (alert_id, source_ip, features["domain"], severity, ts, ts),

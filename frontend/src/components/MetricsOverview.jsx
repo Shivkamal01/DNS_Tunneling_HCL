@@ -3,13 +3,7 @@ import {
   ShieldIcon, AlertOctagonIcon, ActivityIcon,
   CheckCircleIcon, DatabaseIcon,
 } from './Icons';
-
-function formatBytes(bytes) {
-  if (!bytes || bytes <= 0) return '0 B';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
+import { formatBytes } from '../utils/format';
 
 export function MetricsOverview({ stats, avgRisk, totalExfilBytes }) {
   const pendingPct = stats.total > 0 ? Math.round((stats.open / stats.total) * 100) : 0;
@@ -29,26 +23,30 @@ export function MetricsOverview({ stats, avgRisk, totalExfilBytes }) {
           <span className="metric-subtext">avg risk {avgRisk}</span>
         </div>
         <div className="metric-footer">
-          <span className="metric-badge neutral">Entropy + lexical engine</span>
+          <span className="metric-badge neutral">
+            {stats.suppressed > 0
+              ? `${stats.suppressed} suppressed by whitelist`
+              : 'No queries suppressed'}
+          </span>
         </div>
       </div>
 
       <div className="metric-card critical">
         <div className="metric-header">
-          <span className="metric-title">Critical</span>
+          <span className="metric-title">Open critical</span>
           <div className="metric-icon-bubble red">
             <AlertOctagonIcon size={13} />
           </div>
         </div>
         <div className="metric-value-row">
-          <span className="metric-value red-text">{stats.critical}</span>
-          <span className={`metric-subtext ${stats.critical > 0 ? 'alert-text' : 'success-text'}`}>
-            {stats.critical > 0 ? 'needs triage' : 'none open'}
+          <span className="metric-value red-text">{stats.criticalOpen}</span>
+          <span className={`metric-subtext ${stats.criticalOpen > 0 ? 'alert-text' : 'success-text'}`}>
+            {stats.critical > 0 ? `${stats.critical} recorded` : 'none recorded'}
           </span>
         </div>
         <div className="metric-footer">
-          <span className={`metric-badge ${stats.critical > 0 ? 'red' : 'green'}`}>
-            {stats.critical > 0 ? 'Escalated' : 'Nominal'}
+          <span className={`metric-badge ${stats.criticalOpen > 0 ? 'red' : 'green'}`}>
+            {stats.criticalOpen > 0 ? 'Needs triage' : 'No open criticals'}
           </span>
         </div>
       </div>
@@ -62,7 +60,7 @@ export function MetricsOverview({ stats, avgRisk, totalExfilBytes }) {
         </div>
         <div className="metric-value-row">
           <span className="metric-value orange-text">{stats.open}</span>
-          <span className="metric-subtext">{pendingPct}% awaiting</span>
+          <span className="metric-subtext">{pendingPct}% of all alerts</span>
         </div>
         <div className="metric-footer">
           <span className="metric-badge orange">
@@ -84,7 +82,7 @@ export function MetricsOverview({ stats, avgRisk, totalExfilBytes }) {
         </div>
         <div className="metric-footer">
           <span className="metric-badge green">
-            {stats.suppressed} suppressed by whitelist
+            {resolvedPct}% of all alerts closed out
           </span>
         </div>
       </div>

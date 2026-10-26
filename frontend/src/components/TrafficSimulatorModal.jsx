@@ -1,5 +1,51 @@
-import React, { useEffect, useState } from 'react';
-import { XIcon, PlayIcon, RefreshIcon, TerminalIcon, DatabaseIcon } from './Icons';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  XIcon, PlayIcon, RefreshIcon, TerminalIcon, DatabaseIcon, AlertCircleIcon,
+} from './Icons';
+import {
+  useBodyScrollLock,
+  useEscapeKey,
+  useFocusReturn,
+  useFocusTrap,
+} from '../utils/overlay';
+
+const SCENARIOS = [
+  {
+    key: 'all',
+    title: 'Mixed traffic',
+    desc: 'One batch across every profile — useful for a broad smoke test.',
+    profiles: 14,
+  },
+  {
+    key: 'base32_exfil',
+    title: 'Base32 exfiltration',
+    desc: 'Alphanumeric chunks packed into deep labels.',
+    profiles: 3,
+  },
+  {
+    key: 'c2_beaconing',
+    title: 'dnscat2 beaconing',
+    desc: 'TXT queries carrying a dnscat2 session label.',
+    profiles: 3,
+  },
+  {
+    key: 'iodine_hex',
+    title: 'Iodine hex tunnel',
+    desc: 'Pure-hex chunks with no natural word shape.',
+    profiles: 3,
+  },
+  {
+    key: 'benign',
+    title: 'Benign browsing',
+    desc: 'Everyday corporate lookups — should score zero.',
+    profiles: 5,
+  },
+];
+
+const MAX_BY_SCENARIO = SCENARIOS.reduce((acc, scenario) => {
+  acc[scenario.key] = scenario.profiles;
+  return acc;
+}, {});
 
 export function TrafficSimulatorModal({
   isOpen,
@@ -14,14 +60,32 @@ export function TrafficSimulatorModal({
   const [isIngestingZeek, setIsIngestingZeek] = useState(false);
   const [isIngestingPcap, setIsIngestingPcap] = useState(false);
   const [resultMessage, setResultMessage] = useState(null);
+  const modalRef = useRef(null);
 
-  // Escape closes the modal, matching the drawer and telemetry panel.
+  const maxCount = MAX_BY_SCENARIO[scenario] || 5;
+  const selectedScenario = useMemo(
+    () => SCENARIOS.find((item) => item.key === scenario),
+    [scenario],
+  );
+
+  useBodyScrollLock(isOpen);
+  useFocusReturn(isOpen, modalRef);
+  useFocusTrap(isOpen, modalRef);
+  useEscapeKey(isOpen, onClose);
+
+  // Switching from "Mixed traffic" to a three-profile scenario must not leave
+  // the slider promising fourteen queries that the backend cannot supply.
   useEffect(() => {
-    if (!isOpen) return undefined;
-    const handler = (event) => { if (event.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [isOpen, onClose]);
+    setCount((current) => Math.min(current, maxCount));
+  }, [maxCount]);
+
+  // Reset transient output when the panel closes so reopening shows the
+  // controls fresh rather than a stale result from a previous run.
+  useEffect(() => {
+    if (!isOpen) setResultMessage(null);
+  }, [isOpen]);
+
+  const isBusy = isSimulating || isIngestingZeek || isIngestingPcap;
 
   if (!isOpen) return null;
 
@@ -30,9 +94,19 @@ export function TrafficSimulatorModal({
     setResultMessage(null);
     try {
       const result = await onSimulate(scenario, count);
+      const alerts = result?.alerts_generated ?? 0;
+      const incidents = result?.incidents_generated ?? 0;
+      const failed = result?.failed ?? 0;
+      const attempted = result?.attempted_count ?? count;
+      const resultType = failed === 0
+        ? 'success'
+        : (failed >= attempted ? 'error' : 'warning');
+
       setResultMessage({
-        type: 'success',
-        text: result?.message || `Injected ${count} queries.`,
+        type: resultType,
+        text: `${result?.message || `Injected ${count} queries.`}`
+          + (failed ? ` ${failed} record${failed === 1 ? '' : 's'} failed and were skipped.` : ''),
+        meta: `${alerts} alerts · ${incidents} incidents escalated`,
       });
     } catch (error) {
       setResultMessage({ type: 'error', text: error?.message || 'Simulation failed.' });
@@ -46,9 +120,12 @@ export function TrafficSimulatorModal({
     setResultMessage(null);
     try {
       const result = await onIngestZeek();
+      const failed = result?.failed ?? 0;
       setResultMessage({
-        type: 'success',
-        text: `Zeek import: ${result?.inserted ?? 0} new queries, ${result?.skipped ?? 0} duplicates skipped, ${result?.alerts ?? 0} alerts, ${result?.incidents ?? 0} incidents.`,
+        type: failed > 0 ? 'warning' : 'success',
+        text: `Zeek import: ${result?.inserted ?? 0} new queries, ${result?.skipped ?? 0} duplicates skipped, ${result?.alerts ?? 0} alerts`
+          + (failed ? `, ${failed} failed` : '') + '.',
+        meta: `${result?.incidents ?? 0} incidents escalated`,
       });
     } catch (error) {
       setResultMessage({ type: 'error', text: error?.message || 'Zeek ingestion failed.' });
@@ -62,9 +139,12 @@ export function TrafficSimulatorModal({
     setResultMessage(null);
     try {
       const result = await onIngestPcap();
+      const failed = result?.failed ?? 0;
       setResultMessage({
-        type: 'success',
-        text: `PCAP import: ${result?.inserted ?? 0} new queries, ${result?.skipped ?? 0} duplicates skipped, ${result?.alerts ?? 0} alerts.`,
+        type: failed > 0 ? 'warning' : 'success',
+        text: `PCAP import: ${result?.inserted ?? 0} new queries, ${result?.skipped ?? 0} duplicates skipped, ${result?.alerts ?? 0} alerts`
+          + (failed ? `, ${failed} failed` : '') + '.',
+        meta: `${result?.incidents ?? 0} incidents escalated`,
       });
     } catch (error) {
       setResultMessage({ type: 'error', text: error?.message || 'PCAP analysis failed.' });
@@ -75,11 +155,22 @@ export function TrafficSimulatorModal({
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-container" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+      <div
+        className="modal-container"
+        ref={modalRef}
+        tabIndex={-1}
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="simulator-title"
+      >
         <div className="modal-header">
           <div className="modal-title-wrap">
             <PlayIcon size={15} color="var(--accent)" />
-            <h3>Traffic simulator</h3>
+            <div>
+              <h3 id="simulator-title">Traffic simulator</h3>
+              <span className="modal-subtitle">Synthetic queries, real scoring engine</span>
+            </div>
           </div>
           <button className="modal-close-btn" onClick={onClose} aria-label="Close modal">
             <XIcon size={18} />
@@ -88,96 +179,73 @@ export function TrafficSimulatorModal({
 
         <div className="modal-body">
           <p className="modal-description">
-            Push synthetic queries through the real scoring pipeline. Benign scenarios exist to prove the whitelist suppresses them — if one raises an alert, the rule set needs work.
+            Push synthetic queries through the same feature extraction and scoring path as live
+            telemetry. Benign scenarios use ordinary corporate lookups and should stay at zero; a
+            raised alert there means the scoring thresholds or whitelist need review.
           </p>
 
-          {/* Scenario Selection */}
+          <div className="sim-live-warning" role="note">
+            <AlertCircleIcon size={14} />
+            <span>
+              This writes to the connected database. Repeated runs create new queries, alerts and
+              incidents, just like a live sensor.
+            </span>
+          </div>
+
           <div className="sim-group">
             <label className="sim-label">Scenario</label>
             <div className="sim-scenario-grid">
-              <label className={`sim-card ${scenario === 'all' ? 'active' : ''}`}>
-                <input
-                  type="radio"
-                  name="scenario"
-                  value="all"
-                  checked={scenario === 'all'}
-                  onChange={() => setScenario('all')}
-                />
-                <div className="sim-card-title">Mixed traffic</div>
-                <div className="sim-card-desc">All four profiles in one batch.</div>
-              </label>
-
-              <label className={`sim-card ${scenario === 'base32_exfil' ? 'active' : ''}`}>
-                <input
-                  type="radio"
-                  name="scenario"
-                  value="base32_exfil"
-                  checked={scenario === 'base32_exfil'}
-                  onChange={() => setScenario('base32_exfil')}
-                />
-                <div className="sim-card-title">Base32 exfiltration</div>
-                <div className="sim-card-desc">Alphanumeric chunks packed into deep labels.</div>
-              </label>
-
-              <label className={`sim-card ${scenario === 'c2_beaconing' ? 'active' : ''}`}>
-                <input
-                  type="radio"
-                  name="scenario"
-                  value="c2_beaconing"
-                  checked={scenario === 'c2_beaconing'}
-                  onChange={() => setScenario('c2_beaconing')}
-                />
-                <div className="sim-card-title">dnscat2 beaconing</div>
-                <div className="sim-card-desc">TXT queries carrying a dnscat2 session label.</div>
-              </label>
-
-              <label className={`sim-card ${scenario === 'iodine_hex' ? 'active' : ''}`}>
-                <input
-                  type="radio"
-                  name="scenario"
-                  value="iodine_hex"
-                  checked={scenario === 'iodine_hex'}
-                  onChange={() => setScenario('iodine_hex')}
-                />
-                <div className="sim-card-title">Iodine hex tunnel</div>
-                <div className="sim-card-desc">Pure-hex chunks with no natural word shape.</div>
-              </label>
-
-              <label className={`sim-card ${scenario === 'benign' ? 'active' : ''}`}>
-                <input
-                  type="radio"
-                  name="scenario"
-                  value="benign"
-                  checked={scenario === 'benign'}
-                  onChange={() => setScenario('benign')}
-                />
-                <div className="sim-card-title">Benign browsing</div>
-                <div className="sim-card-desc">Everyday corporate lookups — should score zero.</div>
-              </label>
+              {SCENARIOS.map((item) => (
+                <label
+                  key={item.key}
+                  className={`sim-card ${scenario === item.key ? 'active' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name="scenario"
+                    value={item.key}
+                    checked={scenario === item.key}
+                    onChange={() => setScenario(item.key)}
+                    disabled={isBusy}
+                  />
+                  <div className="sim-card-title-row">
+                    <div className="sim-card-title">{item.title}</div>
+                    <span className="sim-card-count mono">{item.profiles}</span>
+                  </div>
+                  <div className="sim-card-desc">{item.desc}</div>
+                </label>
+              ))}
             </div>
           </div>
 
-          {/* Query Count */}
           <div className="sim-group">
             <div className="sim-count-row">
-              <label className="sim-label">Queries</label>
-              <span className="mono count-display">{count} queries</span>
+              <label className="sim-label" htmlFor="sim-count">Queries</label>
+              <span className="mono count-display">
+                {count} {count === 1 ? 'query' : 'queries'}
+                <span className="count-max"> · max {selectedScenario?.profiles ?? maxCount}</span>
+              </span>
             </div>
             <input
+              id="sim-count"
               type="range"
               min="1"
-              max="15"
+              max={maxCount}
               value={count}
-              onChange={(e) => setCount(parseInt(e.target.value, 10))}
+              onChange={(event) => setCount(parseInt(event.target.value, 10))}
               className="sim-slider"
+              disabled={isBusy}
             />
+            <div className="sim-slider-scale mono">
+              <span>1</span>
+              <span>{maxCount}</span>
+            </div>
           </div>
 
-          {/* Action Trigger */}
           <button
             className="btn-trigger-sim primary"
             onClick={handleRunSim}
-            disabled={isSimulating}
+            disabled={isSimulating || isBusy}
           >
             {isSimulating ? (
               <>
@@ -192,14 +260,14 @@ export function TrafficSimulatorModal({
             )}
           </button>
 
-          {/* Ingestion Pipelines Section */}
           <div className="pipeline-ingest-section">
-            <div className="pipeline-title">Import from file</div>
+            <div className="pipeline-title">Import from a bundled capture</div>
             <div className="pipeline-buttons">
               <button
                 className="btn-pipeline"
                 onClick={handleZeek}
-                disabled={isIngestingZeek}
+                disabled={isBusy}
+                title="Import zeek/logs/dns.log"
               >
                 <TerminalIcon size={14} />
                 <span>{isIngestingZeek ? 'Importing…' : 'zeek/logs/dns.log'}</span>
@@ -208,18 +276,26 @@ export function TrafficSimulatorModal({
               <button
                 className="btn-pipeline"
                 onClick={handlePcap}
-                disabled={isIngestingPcap}
+                disabled={isBusy}
+                title="Parse datasets/suspicious/test_traffic.pcap"
               >
                 <DatabaseIcon size={14} />
                 <span>{isIngestingPcap ? 'Parsing…' : 'test_traffic.pcap'}</span>
               </button>
             </div>
+            <p className="pipeline-hint">
+              Both files are already de-duplicated on import, so a second run reports skipped
+              rows instead of doubling the dashboard.
+            </p>
           </div>
 
-          {/* Result Banner */}
           {resultMessage && (
-            <div className={`sim-result-banner ${resultMessage.type}`}>
-              {resultMessage.text}
+            <div
+              className={`sim-result-banner ${resultMessage.type}`}
+              role={resultMessage.type === 'error' ? 'alert' : 'status'}
+            >
+              <span>{resultMessage.text}</span>
+              {resultMessage.meta && <span className="sim-result-meta">{resultMessage.meta}</span>}
             </div>
           )}
         </div>

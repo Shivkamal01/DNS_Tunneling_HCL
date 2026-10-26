@@ -13,19 +13,21 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Literal, Optional
 
 import psycopg2
 import uvicorn
 from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import DB_CONFIG
-from ingest import ingest_record, load_whitelist
+from ingest import ingest_record_safe, load_whitelist
 from utils import extract_dns_features, evaluate_risk
 from zeek_ingest import parse_zeek_dns_log
 
@@ -83,6 +85,23 @@ app.add_middleware(
 
 ALERT_STATUSES = ("OPEN", "INVESTIGATING", "CONTAINED", "RESOLVED", "FALSE POSITIVE")
 INCIDENT_STATUSES = ALERT_STATUSES + ("CLOSED",)
+APP_STARTED_AT = datetime.now(timezone.utc)
+
+
+# ─── Health ─────────────────────────────────────────────────────────────────
+@app.get("/api/health")
+def health():
+    """Cheap liveness check the dashboard can use without pulling telemetry."""
+    with db_cursor() as (conn, cursor):
+        cursor.execute("SELECT 1 AS ok;")
+        cursor.fetchone()
+    return {
+        "status": "ok",
+        "database": "connected",
+        "version": app.version,
+        "started_at": APP_STARTED_AT.isoformat().replace("+00:00", "Z"),
+        "server_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
 # ─── Infrastructure helpers ─────────────────────────────────────────────────
@@ -112,6 +131,46 @@ async def db_error_handler(request: Request, exc: psycopg2.Error):
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """Keep validation failures in the same envelope as every other route."""
+    first = exc.errors()[0] if exc.errors() else {}
+    location = ".".join(
+        str(part) for part in first.get("loc", ()) if part not in ("body", "query", "path")
+    )
+    message = first.get("msg", "Request validation failed")
+    detail = f"{location}: {message}" if location else message
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"message": "Validation failed", "detail": detail}},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    message = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"message": message, "detail": ""}},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    """Log the traceback server-side but never leak internals to the client."""
+    logger.exception("Unhandled error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "message": "Internal server error",
+                "detail": "The request could not be completed.",
+            }
+        },
+    )
+
+
 @contextmanager
 def db_cursor(dict_rows: bool = True):
     """
@@ -135,13 +194,22 @@ def db_cursor(dict_rows: bool = True):
 
 
 def serialize_dates(value):
-    """Recursively convert datetime values to ISO strings for JSON responses."""
+    """Recursively convert datetime values to unambiguous ISO-8601 strings.
+
+    PostgreSQL columns in this project are naive TIMESTAMP values written from
+    the server's local clock. Attaching the local offset before converting to
+    UTC means a browser in another timezone still renders the correct instant;
+    without it, JavaScript would interpret the naive string as its own local
+    time and silently shift the alert history.
+    """
     if isinstance(value, list):
         return [serialize_dates(item) for item in value]
     if isinstance(value, dict):
         return {key: serialize_dates(item) for key, item in value.items()}
     if isinstance(value, datetime):
-        return value.isoformat()
+        if value.tzinfo is None:
+            value = value.astimezone()
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return value
 
 
@@ -152,7 +220,7 @@ def split_indicators(raw: Optional[str]) -> List[str]:
 # ─── Request models ─────────────────────────────────────────────────────────
 class StatusUpdate(BaseModel):
     status: str
-    analyst_notes: Optional[str] = None
+    analyst_notes: Optional[str] = Field(default=None, max_length=4000)
 
     @field_validator("status")
     @classmethod
@@ -165,8 +233,8 @@ class StatusUpdate(BaseModel):
 
 class IncidentUpdate(BaseModel):
     status: Optional[str] = None
-    assigned_to: Optional[str] = None
-    analyst_notes: Optional[str] = None
+    assigned_to: Optional[str] = Field(default=None, max_length=100)
+    analyst_notes: Optional[str] = Field(default=None, max_length=4000)
 
     @field_validator("status")
     @classmethod
@@ -181,7 +249,7 @@ class IncidentUpdate(BaseModel):
 
 class WhitelistCreate(BaseModel):
     domain_pattern: str = Field(min_length=3, max_length=255)
-    reason: Optional[str] = "Manual analyst whitelist rule"
+    reason: Optional[str] = Field(default="Manual analyst whitelist rule", max_length=500)
 
     @field_validator("domain_pattern")
     @classmethod
@@ -189,7 +257,13 @@ class WhitelistCreate(BaseModel):
         cleaned = value.strip().strip(".").lower()
         if "." not in cleaned:
             raise ValueError("domain_pattern must contain at least one dot")
-        if not all(c.isalnum() or c in ".-_*" for c in cleaned):
+        if "*" in cleaned:
+            raise ValueError(
+                "Wildcards are not supported; add a concrete domain suffix instead"
+            )
+        if ".." in cleaned:
+            raise ValueError("domain_pattern contains an empty label")
+        if not all(c.isalnum() or c in ".-_" for c in cleaned):
             raise ValueError("domain_pattern contains invalid characters")
         return cleaned
 
@@ -336,19 +410,29 @@ def update_alert_status(alert_id: int, update: StatusUpdate):
         if cursor.fetchone() is None:
             raise ApiError(404, "Alert not found", f"No alert with id {alert_id}")
 
-        # Keep the linked incident lifecycle in step with its alert.
+        # Keep the linked incident lifecycle in step with its alert, but never
+        # reopen a case that has already been closed out. Resolving or marking
+        # an alert as a false positive must propagate; reopening a terminal
+        # incident because an analyst re-read the alert must not.
         cursor.execute(
             """
             UPDATE incidents
                SET status = %s,
-                   analyst_notes = COALESCE(%s, analyst_notes),
                    updated_at = CURRENT_TIMESTAMP
-             WHERE alert_id = %s;
+             WHERE alert_id = %s
+               AND NOT (
+                   UPPER(status) IN ('RESOLVED', 'CLOSED', 'FALSE POSITIVE')
+                   AND %s NOT IN ('RESOLVED', 'CLOSED', 'FALSE POSITIVE')
+               );
             """,
-            (update.status, update.analyst_notes, alert_id),
+            (update.status, alert_id, update.status),
         )
 
-        return {"status": "success", "message": f"Alert #{alert_id} marked {update.status}"}
+        return {
+            "status": "success",
+            "message": f"Alert #{alert_id} marked {update.status}",
+            "data": {"id": alert_id, "status": update.status},
+        }
 
 
 # ─── Incidents ──────────────────────────────────────────────────────────────
@@ -404,12 +488,31 @@ def update_incident(incident_id: int, update: IncidentUpdate):
                    analyst_notes = COALESCE(%s, analyst_notes),
                    updated_at = CURRENT_TIMESTAMP
              WHERE id = %s
-            RETURNING id;
+            RETURNING id, alert_id, status;
             """,
             (update.status, update.assigned_to, update.analyst_notes, incident_id),
         )
-        if cursor.fetchone() is None:
+        row = cursor.fetchone()
+        if row is None:
             raise ApiError(404, "Incident not found", f"No incident with id {incident_id}")
+
+        incident_id, alert_id, _incident_status = row
+
+        # Closing a case should close the parent alert too. The alert lifecycle
+        # has no CLOSED state, so map CLOSED onto RESOLVED while keeping the
+        # incident's more specific state.
+        if update.status in ("RESOLVED", "CLOSED", "FALSE POSITIVE"):
+            alert_status = "RESOLVED" if update.status == "CLOSED" else update.status
+            cursor.execute(
+                """
+                UPDATE alerts
+                   SET status = %s,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = %s;
+                """,
+                (alert_status, alert_id),
+            )
+
         return {"status": "success", "message": "Incident updated"}
 
 
@@ -423,7 +526,7 @@ def list_queries(limit: int = Query(60, ge=1, le=500)):
                    COALESCE(q.qtype_name, 'A') AS qtype_name, q.ttl,
                    f.entropy, f.entropy_ratio, f.query_length, f.subdomain_length,
                    f.est_payload_bytes, f.encoding, f.is_whitelisted,
-                   a.risk_score, a.severity, a.status
+                   a.id AS alert_id, a.risk_score, a.severity, a.status
             FROM dns_queries q
             LEFT JOIN dns_features f ON q.id = f.query_id
             LEFT JOIN alerts a ON q.id = a.query_id
@@ -445,6 +548,9 @@ def get_metrics():
                 (SELECT count(*) FROM dns_queries) AS total_queries,
                 (SELECT count(*) FROM alerts) AS total_alerts,
                 (SELECT count(*) FROM alerts WHERE UPPER(severity) = 'CRITICAL') AS critical_alerts,
+                (SELECT count(*) FROM alerts
+                  WHERE UPPER(severity) = 'CRITICAL'
+                    AND UPPER(status) IN ('OPEN','INVESTIGATING')) AS critical_open_alerts,
                 (SELECT count(*) FROM alerts WHERE UPPER(severity) = 'HIGH') AS high_alerts,
                 (SELECT count(*) FROM alerts WHERE UPPER(severity) = 'MEDIUM') AS medium_alerts,
                 (SELECT count(*) FROM alerts WHERE UPPER(severity) = 'LOW') AS low_alerts,
@@ -452,7 +558,7 @@ def get_metrics():
                 (SELECT count(*) FROM alerts WHERE UPPER(status) = 'INVESTIGATING') AS investigating_alerts,
                 (SELECT count(*) FROM alerts WHERE UPPER(status) IN ('RESOLVED', 'FALSE POSITIVE')) AS resolved_alerts,
                 (SELECT count(*) FROM incidents) AS total_incidents,
-                (SELECT count(*) FROM incidents WHERE UPPER(status) IN ('OPEN','INVESTIGATING')) AS active_incidents,
+                (SELECT count(*) FROM incidents WHERE UPPER(COALESCE(status, 'OPEN')) NOT IN ('RESOLVED','CLOSED','FALSE POSITIVE')) AS active_incidents,
                 (SELECT COALESCE(ROUND(AVG(risk_score)), 0) FROM alerts) AS avg_risk_score,
                 (SELECT COALESCE(count(*), 0) FROM dns_features WHERE is_whitelisted) AS suppressed_queries,
                 (SELECT COALESCE(SUM(f.est_payload_bytes), 0)
@@ -476,7 +582,8 @@ def get_metrics():
 
         cursor.execute(
             """
-            SELECT q.source_ip, count(*) AS alert_count, max(a.risk_score) AS max_risk
+            SELECT COALESCE(q.source_ip, 'unknown') AS source_ip,
+                   count(*) AS alert_count, max(a.risk_score) AS max_risk
             FROM alerts a
             JOIN dns_queries q ON a.query_id = q.id
             GROUP BY q.source_ip
@@ -486,19 +593,25 @@ def get_metrics():
         )
         top_ips = cursor.fetchall()
 
-        # Hourly buckets across the most recent activity. The previous version
-        # grouped by 'HH24:MI' with ORDER BY MIN(created_at) ASC LIMIT 15, which
-        # selected the OLDEST fifteen buckets — the chart froze at the moment
-        # the database was created.
+        # Hourly buckets across the most recent activity, grouped on UTC hour
+        # boundaries. Stored timestamps are naive server-local values, so they
+        # are first interpreted in the database session timezone and then
+        # converted to UTC; the dashboard labels every timestamp as UTC.
         cursor.execute(
             """
-            SELECT to_char(date_trunc('hour', a.created_at), 'YYYY-MM-DD HH24:00') AS time_bucket,
+            SELECT (
+                       date_trunc(
+                           'hour',
+                           (a.created_at AT TIME ZONE current_setting('TimeZone'))
+                               AT TIME ZONE 'UTC'
+                       ) AT TIME ZONE 'UTC'
+                   ) AS time_bucket,
                    count(*) AS alert_count,
                    round(avg(a.risk_score)) AS avg_risk,
                    max(a.risk_score) AS max_risk
             FROM alerts a
-            GROUP BY date_trunc('hour', a.created_at)
-            ORDER BY date_trunc('hour', a.created_at) DESC
+            GROUP BY 1
+            ORDER BY 1 DESC
             LIMIT 15;
             """
         )
@@ -565,7 +678,7 @@ def simulate_traffic(req: SimulationRequest):
     pool = SCENARIOS[req.scenario] if req.scenario != "all" else [q for group in SCENARIOS.values() for q in group]
     chosen = random.sample(pool, min(req.count, len(pool)))
 
-    alerts = incidents = 0
+    alerts = incidents = failed = 0
     with db_cursor(dict_rows=False) as (conn, cursor):
         load_whitelist(cursor)
         now = datetime.now()
@@ -580,25 +693,41 @@ def simulate_traffic(req: SimulationRequest):
 
             # Offset by whole seconds: adding to datetime.microsecond can
             # overflow past 999999 and raise ValueError.
-            result = ingest_record(
-                cursor,
-                domain=domain,
-                query_type=qtype,
-                source_ip=src_ip,
-                timestamp=now + timedelta(seconds=seq),
-                ttl=60,
-            )
+            try:
+                result = ingest_record_safe(
+                    cursor,
+                    domain=domain,
+                    query_type=qtype,
+                    source_ip=src_ip,
+                    timestamp=now + timedelta(seconds=seq),
+                    ttl=60,
+                )
+            except Exception as exc:
+                failed += 1
+                logger.warning("Simulation record failed (%s): %s", domain, exc)
+                continue
+
             if result["alert_id"]:
                 alerts += 1
             if result["incident_id"]:
                 incidents += 1
 
+    injected = len(chosen) - failed
+    query_word = "query" if injected == 1 else "queries"
+    alert_word = "alert" if alerts == 1 else "alerts"
+    incident_word = "incident" if incidents == 1 else "incidents"
+
     return {
         "status": "success",
-        "message": f"Injected {len(chosen)} queries — {alerts} alerts, {incidents} incidents escalated.",
-        "injected_count": len(chosen),
+        "message": (
+            f"Injected {injected} {query_word} — {alerts} {alert_word}, "
+            f"{incidents} {incident_word} escalated."
+        ),
+        "attempted_count": len(chosen),
+        "injected_count": injected,
         "alerts_generated": alerts,
         "incidents_generated": incidents,
+        "failed": failed,
     }
 
 
@@ -706,6 +835,14 @@ EXPORT_COLUMNS = [
 ]
 
 
+def _csv_safe(value) -> str:
+    """Prevent analyst-controlled text from becoming a spreadsheet formula."""
+    text = "" if value is None else str(value)
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
+
+
 @app.get("/api/export")
 def export_alerts(format: Literal["csv", "json"] = Query("csv")):
     with db_cursor() as (conn, cursor):
@@ -731,7 +868,7 @@ def export_alerts(format: Literal["csv", "json"] = Query("csv")):
         return JSONResponse(
             status_code=200,
             content=serialize_dates({
-                "exported_at": datetime.now().isoformat(),
+                "exported_at": datetime.now(timezone.utc),
                 "count": len(rows),
                 "alerts": rows,
             }),
@@ -743,7 +880,10 @@ def export_alerts(format: Literal["csv", "json"] = Query("csv")):
     writer.writerow([label for label, _ in EXPORT_COLUMNS])
     for row in rows:
         writer.writerow([
-            row.get(key).isoformat() if isinstance(row.get(key), datetime) else (row.get(key) or "")
+            _csv_safe(
+                serialize_dates(row.get(key)) if isinstance(row.get(key), datetime)
+                else row.get(key)
+            )
             for _, key in EXPORT_COLUMNS
         ])
 

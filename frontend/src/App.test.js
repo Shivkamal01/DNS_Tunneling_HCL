@@ -20,7 +20,7 @@ jest.mock('./services/api', () => {
 test('renders the dashboard shell', async () => {
   render(<App />);
   expect(await screen.findByRole('banner')).toBeInTheDocument();
-  expect(screen.getByText(/dns tunneling detection/i)).toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: /dns tunneling detection/i })).toBeInTheDocument();
 });
 
 test('exposes the three primary views', async () => {

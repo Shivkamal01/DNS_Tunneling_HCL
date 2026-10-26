@@ -1,5 +1,6 @@
 import React, { useRef, useEffect } from 'react';
 import { SearchIcon, XIcon, ActivityIcon } from './Icons';
+import { formatDateTime, slaFor, timeAgo } from '../utils/format';
 
 const SEVERITY_COLORS = {
   CRITICAL: '#d3564f',
@@ -16,23 +17,6 @@ const STATUS_CONFIG = {
   'FALSE POSITIVE': { label: 'False pos.',  color: '#6b6b76', bg: 'rgba(107,107,118,0.12)' },
 };
 
-function formatTimestamp(ts) {
-  if (!ts) return '—';
-  try {
-    const d = new Date(ts);
-    if (isNaN(d.getTime())) return '—';
-    return d.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false
-    });
-  } catch {
-    return '—';
-  }
-}
-
 function highlightMatch(text, query) {
   if (!query || !text) return text || '';
   const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -47,6 +31,7 @@ function highlightMatch(text, query) {
 export function AlertsTable({
   alerts,
   filteredAlerts,
+  totalAlerts = 0,
   filterSeverity,
   setFilterSeverity,
   filterStatus,
@@ -67,6 +52,9 @@ export function AlertsTable({
   useEffect(() => {
     const handler = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        // Do not pull focus out of an open drawer or modal; the overlay owns
+        // the interaction until it closes.
+        if (document.querySelector('.drawer-backdrop, .modal-backdrop')) return;
         e.preventDefault();
         searchInputRef.current?.focus();
       }
@@ -87,6 +75,22 @@ export function AlertsTable({
     if (sortConfig.key !== key) return <span className="sort-indicator neutral">⇅</span>;
     return <span className="sort-indicator active">{sortConfig.dir === 'desc' ? '↓' : '↑'}</span>;
   };
+
+  const ariaSort = (key) => {
+    if (sortConfig.key !== key) return 'none';
+    return sortConfig.dir === 'desc' ? 'descending' : 'ascending';
+  };
+
+  const sortableProps = (key) => ({
+    onClick: () => onSort(key),
+    onKeyDown: (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        onSort(key);
+      }
+    },
+    tabIndex: 0,
+  });
 
   return (
     <div className="panel table-panel">
@@ -113,7 +117,7 @@ export function AlertsTable({
           </div>
 
           {/* Severity Pills */}
-          <div className="filter-pill-group" role="tablist" aria-label="Filter severity">
+          <div className="filter-pill-group" role="group" aria-label="Filter severity">
             {['ALL', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].map(sev => (
               <button
                 key={sev}
@@ -151,7 +155,10 @@ export function AlertsTable({
 
           <div className="table-count-badge">
             <strong>{filteredAlerts.length}</strong>
-            <span>{filteredAlerts.length === 1 ? 'alert' : 'alerts'}</span>
+            <span>
+              of {totalAlerts || alerts.length}
+              {totalAlerts > alerts.length ? ` · ${alerts.length} loaded` : ''}
+            </span>
           </div>
         </div>
       </div>
@@ -161,17 +168,17 @@ export function AlertsTable({
         <table className="soc-table">
           <thead>
             <tr>
-              <th className="th-id" onClick={() => onSort('id')}>ID {getSortIcon('id')}</th>
-              <th className="th-sev" onClick={() => onSort('severity')}>Severity {getSortIcon('severity')}</th>
-              <th className="th-domain" onClick={() => onSort('domain')}>Domain &amp; Record {getSortIcon('domain')}</th>
-              <th className="th-ip" onClick={() => onSort('source_ip')}>Source IP {getSortIcon('source_ip')}</th>
-              <th className="th-risk" onClick={() => onSort('risk_score')}>Risk Score {getSortIcon('risk_score')}</th>
-              <th className="th-entropy" onClick={() => onSort('entropy')}>Entropy {getSortIcon('entropy')}</th>
-              <th className="th-encoding">Encoding</th>
-              <th className="th-trigger">Primary indicator</th>
-              <th className="th-time" onClick={() => onSort('created_at')}>Time {getSortIcon('created_at')}</th>
-              <th className="th-status" onClick={() => onSort('status')}>Status {getSortIcon('status')}</th>
-              <th className="th-action">Triage</th>
+              <th scope="col" className="th-id" aria-sort={ariaSort('id')} {...sortableProps('id')}>ID {getSortIcon('id')}</th>
+              <th scope="col" className="th-sev" aria-sort={ariaSort('severity')} {...sortableProps('severity')}>Severity {getSortIcon('severity')}</th>
+              <th scope="col" className="th-domain" aria-sort={ariaSort('domain')} {...sortableProps('domain')}>Domain &amp; Record {getSortIcon('domain')}</th>
+              <th scope="col" className="th-ip" aria-sort={ariaSort('source_ip')} {...sortableProps('source_ip')}>Source IP {getSortIcon('source_ip')}</th>
+              <th scope="col" className="th-risk" aria-sort={ariaSort('risk_score')} {...sortableProps('risk_score')}>Risk Score {getSortIcon('risk_score')}</th>
+              <th scope="col" className="th-entropy" aria-sort={ariaSort('entropy')} {...sortableProps('entropy')}>Entropy {getSortIcon('entropy')}</th>
+              <th scope="col" className="th-encoding">Encoding</th>
+              <th scope="col" className="th-trigger">Primary indicator</th>
+              <th scope="col" className="th-time" aria-sort={ariaSort('created_at')} {...sortableProps('created_at')}>Detected {getSortIcon('created_at')}</th>
+              <th scope="col" className="th-status" aria-sort={ariaSort('status')} {...sortableProps('status')}>Status {getSortIcon('status')}</th>
+              <th scope="col" className="th-action">Triage</th>
             </tr>
           </thead>
           <tbody>
@@ -188,11 +195,15 @@ export function AlertsTable({
               <tr>
                 <td colSpan="11" className="table-state-cell">
                   <div className="table-empty-wrap">
-                    <SearchIcon size={28} color="#475569" />
-                    <p>No security alerts matched the selected filters.</p>
-                    {hasFilters && (
+                    <SearchIcon size={28} color="var(--text-dim)" />
+                    <p>
+                      {alerts.length === 0
+                        ? 'No alerts have been recorded yet. Import telemetry or run a simulation to exercise the engine.'
+                        : 'No security alerts matched the selected filters.'}
+                    </p>
+                    {hasFilters && alerts.length > 0 && (
                       <button className="btn-action primary" onClick={clearFilters}>
-                        Clear All Filter Criteria
+                        Clear all filters
                       </button>
                     )}
                   </div>
@@ -201,15 +212,26 @@ export function AlertsTable({
             ) : (
               filteredAlerts.map(alert => {
                 const isSelected = selectedAlertId === alert.id;
-                const statusCfg = STATUS_CONFIG[alert.status] || STATUS_CONFIG['OPEN'];
+                const statusKey = (alert.status || 'OPEN').toUpperCase();
+                const statusCfg = STATUS_CONFIG[statusKey] || STATUS_CONFIG['OPEN'];
                 const sevColor = SEVERITY_COLORS[(alert.severity || 'LOW').toUpperCase()] || '#6b8fb5';
                 const entropyVal = typeof alert.entropy === 'number' ? alert.entropy.toFixed(2) : '—';
+                const sla = slaFor(alert.severity, alert.created_at, Date.now(), alert.status);
 
                 return (
                   <tr
                     key={alert.id}
                     className={`alert-row ${isSelected ? 'row-selected' : ''}`}
                     onClick={() => onSelectAlert(alert)}
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        onSelectAlert(alert);
+                      }
+                    }}
+                    tabIndex={0}
+                    aria-label={`Open alert ${alert.id} for ${alert.domain}`}
                   >
                     {/* ID */}
                     <td className="td-id mono">
@@ -281,8 +303,11 @@ export function AlertsTable({
                     </td>
 
                     {/* Time */}
-                    <td className="td-time">
-                      {formatTimestamp(alert.created_at)}
+                    <td className="td-time" title={`${formatDateTime(alert.created_at)} · ${sla.label}`}>
+                      <span className="time-cell">
+                        <span className={`sla-dot ${sla.state}`} aria-hidden="true" />
+                        <span>{timeAgo(alert.created_at)}</span>
+                      </span>
                     </td>
 
                     {/* Status Dropdown */}
@@ -291,6 +316,8 @@ export function AlertsTable({
                         className="inline-status-select"
                         value={alert.status || 'OPEN'}
                         style={{ color: statusCfg.color, borderColor: `${statusCfg.color}44`, background: statusCfg.bg }}
+                        onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => e.stopPropagation()}
                         onChange={(e) => onStatusChange(alert.id, e.target.value, alert.domain)}
                         aria-label={`Update status for ${alert.domain}`}
                       >
